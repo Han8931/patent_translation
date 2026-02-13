@@ -60,7 +60,13 @@ COMMON_SYSTEM = (
 )
 
 COMMON_USER = (
-    "Translate each JSON item from Korean to English for an English patent application.\n"
+    "Translate each JSON item from Korean to ${target_lang} for an English patent application.\n"
+    "\n"
+    "PREVIOUSLY TRANSLATED TEXT (use this to maintain terminology and style consistency):\n"
+    "${prev_translation}\n"
+    "\n"
+    "ESTABLISHED TERMINOLOGY (you MUST reuse these exact English terms for the corresponding Korean terms):\n"
+    "${glossary}\n"
     "\n"
     "SURROUNDING CONTEXT (for reference, do NOT translate these lines directly):\n"
     "BEFORE:\n${context_before}\n"
@@ -69,16 +75,19 @@ COMMON_USER = (
     "OUTPUT REQUIREMENTS:\n"
     "- Return ONLY valid JSON (no markdown, no explanations).\n"
     "- Use DOUBLE QUOTES for all JSON keys and strings.\n"
-    '- Schema: {"translations":[{"id":"...","text":"..."}]}\n'
+    '- Schema: {"translations":[{"id":"...","text":"..."}], "key_terms":[{"ko":"Korean term","en":"English term"}]}\n'
     "- Keep the same number of items and preserve each id exactly.\n"
+    '- In "key_terms", list all significant technical terms (components, materials, processes, patent-specific noun phrases) you translated in this chunk.\n'
+    "  Do NOT include common words, particles, or grammatical function words.\n"
     "- Output MUST be wrapped exactly like this:\n"
     "BEGIN_JSON\n"
     "{...}\n"
     "END_JSON\n"
     "\n"
     "TERM CONSISTENCY INSTRUCTIONS:\n"
+    "- CRITICAL: If a term appears in ESTABLISHED TERMINOLOGY above, you MUST use that exact English translation.\n"
     "- Use the same English term for the same Korean term across items.\n"
-    "- If an English technical term appears, keep it as-is unless clearly wrong.\n"
+    "- If an English technical term appears in the source, keep it as-is unless clearly wrong.\n"
     "\n"
     "INPUT:\n${payload_json}\n"
 )

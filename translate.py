@@ -44,9 +44,13 @@ class TranslateState(TypedDict):
     prompt_claims: str
     prompt_abstract: str
 
-    # abstract word-count tracking (NEW)
+    # abstract word-count tracking
     abstract_word_count: int
     last_abstract_block_id: str | None
+
+    # cross-chunk context for terminology consistency
+    glossary: Dict[str, str]       # Korean term → English term (accumulated)
+    prev_translated_text: str      # English output of the previous chunk
 
 
 # ============================================================
@@ -87,6 +91,13 @@ def extract_first_json_object(s: str) -> Optional[str]:
 # 2) Translate one chunk with a given prompt
 # ============================================================
 
+def _format_glossary(glossary: Dict[str, str]) -> str:
+    if not glossary:
+        return "(none yet — this is the first chunk)"
+    lines = [f"{ko} → {en}" for ko, en in glossary.items()]
+    return "\n".join(lines)
+
+
 def translate_chunk(
     client: OpenAI,
     model: str,
@@ -96,9 +107,15 @@ def translate_chunk(
     chunk: List[Block],
     context_before: str = "",
     context_after: str = "",
-) -> Dict[str, str]:
+    glossary: Dict[str, str] | None = None,
+    prev_translated_text: str = "",
+) -> tuple[Dict[str, str], List[Dict[str, str]]]:
+    """Translate a chunk and return (translations, key_terms)."""
     prompt = PROMPTS[prompt_name]
     payload = [{"id": b.id, "text": b.text} for b in chunk]
+
+    glossary_str = _format_glossary(glossary or {})
+    prev_translation = prev_translated_text or "(none — this is the first chunk)"
 
     system_prompt = prompt.system
     user_prompt = prompt.render_user(
@@ -106,6 +123,8 @@ def translate_chunk(
         target_lang=target_lang,
         context_before=context_before,
         context_after=context_after,
+        glossary=glossary_str,
+        prev_translation=prev_translation,
     )
 
     resp = client.chat.completions.create(
@@ -114,7 +133,7 @@ def translate_chunk(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        # temperature=0.0,
+        temperature=0.0,
     )
 
     content = (resp.choices[0].message.content or "").strip()
@@ -133,7 +152,16 @@ def translate_chunk(
         for item in translations:
             if isinstance(item, dict) and "id" in item and "text" in item:
                 out[str(item["id"])] = str(item["text"])
-    return out
+
+    # Extract key_terms for glossary accumulation
+    key_terms: List[Dict[str, str]] = []
+    raw_terms = data.get("key_terms", [])
+    if isinstance(raw_terms, list):
+        for term in raw_terms:
+            if isinstance(term, dict) and "ko" in term and "en" in term:
+                key_terms.append({"ko": str(term["ko"]), "en": str(term["en"])})
+
+    return out, key_terms
 
 
 # ============================================================
@@ -238,10 +266,12 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     ctx_before = contexts[i].get("before", "") if i < len(contexts) else ""
     ctx_after = contexts[i].get("after", "") if i < len(contexts) else ""
     sec = state.get("section", "default")
+    glossary = dict(state.get("glossary", {}))
+    prev_translated_text = state.get("prev_translated_text", "")
 
-    print(f"[{sec}] {i}-th chunk...")
+    print(f"[{sec}] {i}-th chunk... (glossary: {len(glossary)} terms)")
 
-    translated_map = translate_chunk(
+    translated_map, key_terms = translate_chunk(
         client=client,
         model=state["model"],
         prompt_name=prompt_name,
@@ -249,10 +279,21 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         chunk=chunk,
         context_before=ctx_before,
         context_after=ctx_after,
+        glossary=glossary,
+        prev_translated_text=prev_translated_text,
     )
 
     results = dict(state["results"])
     results.update(translated_map)
+
+    # Accumulate glossary with newly extracted terms
+    for term in key_terms:
+        glossary[term["ko"]] = term["en"]
+
+    # Build prev_translated_text from this chunk's English output
+    new_prev = "\n".join(
+        translated_map.get(b.id, b.text) for b in chunk
+    )
 
     # Track abstract word count
     abstract_word_count = int(state.get("abstract_word_count", 0))
@@ -261,12 +302,10 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     if sec == "abstract":
         for bid, txt in translated_map.items():
             t = (txt or "").strip()
-            # skip heading-only
             if t.upper() == "ABSTRACT":
                 continue
             abstract_word_count += count_english_words(t)
             last_abstract_block_id = bid
-
 
     return {
         **state,
@@ -274,6 +313,8 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         "i": i + 1,
         "abstract_word_count": abstract_word_count,
         "last_abstract_block_id": last_abstract_block_id,
+        "glossary": glossary,
+        "prev_translated_text": new_prev,
     }
 
 
@@ -366,7 +407,7 @@ def translate_docx(
     model: str,
     target_lang: str = "English",
     max_chars_per_chunk: int = 2500,
-    context_chars: int = 400,
+    context_chars: int = 1000,
     chunk_overlap: int = 0,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -410,9 +451,12 @@ def translate_docx(
             "prompt_claims": prompt_claims,
             "prompt_abstract": prompt_abstract,
 
-            # NEW init
             "abstract_word_count": 0,
             "last_abstract_block_id": None,
+
+            # cross-chunk context for terminology consistency
+            "glossary": {},
+            "prev_translated_text": "",
         },
         config={"recursion_limit": max(50, len(chunks) * 3)},
     )
