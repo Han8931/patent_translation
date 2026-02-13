@@ -353,8 +353,10 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
             t = (txt or "").strip()
             if t.upper() == "ABSTRACT":
                 continue
-            abstract_word_count += count_english_words(t)
-            last_abstract_block_id = bid
+            wc = count_english_words(t)
+            if wc > 0:
+                abstract_word_count += wc
+                last_abstract_block_id = bid
 
     return {
         **state,
