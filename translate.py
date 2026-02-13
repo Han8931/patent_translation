@@ -24,7 +24,7 @@ from prompts import PROMPTS
 # 0) Types
 # ============================================================
 
-Section = Literal["default", "claims", "abstract"]
+Section = Literal["default", "claims", "claims_independent", "claims_dependent", "abstract"]
 
 class TranslateState(TypedDict):
     chunks: List[List[Block]]
@@ -41,7 +41,9 @@ class TranslateState(TypedDict):
     # routing / prompts
     section: Section
     prompt_default: str
-    prompt_claims: str
+    prompt_claims: str  # legacy/fallback
+    prompt_claims_independent: str
+    prompt_claims_dependent: str
     prompt_abstract: str
 
     # abstract word-count tracking
@@ -239,7 +241,6 @@ def detect_section_from_chunk(prev: Section, chunk: List[Block]) -> Section:
     Claims starts with 【청구 범위】 (sometimes without space).
     Abstract starts with 【요약】.
     Sticky behavior: if no heading is found, keep previous section.
-    If abstract already completed, do not re-enter abstract even if headings appear (figures, etc.).
     """
     if prev == "abstract":
         return "abstract"  # let caller handle exit timing
@@ -253,6 +254,23 @@ def detect_section_from_chunk(prev: Section, chunk: List[Block]) -> Section:
         return "abstract"
 
     return prev
+
+
+_DEP_CLAIM_RE = re.compile(r"(청구항\s*\d+|제\s*\d+\s*항)\s*(에\s*따른|에\s*따라|에\s*있어서|의)")
+_FIGURE_RE = re.compile(r"(도\s*\d+[A-Za-z]?|FIG\.\s*\d+|도면의\s*간단한\s*설명)")
+
+def is_dependent_claim_chunk(chunk: List[Block]) -> bool:
+    t = _chunk_text(chunk)
+    return bool(_DEP_CLAIM_RE.search(t))
+
+
+def is_figure_description_chunk(chunk: List[Block]) -> bool:
+    """
+    Heuristic: figure captions or brief description of drawings often follow the abstract.
+    If detected, we should exit the abstract section to avoid counting their words.
+    """
+    t = _chunk_text(chunk)
+    return bool(_FIGURE_RE.search(t))
 
 def node_route_section(state: TranslateState) -> TranslateState:
     i = state["i"]
@@ -276,8 +294,8 @@ def node_route_section(state: TranslateState) -> TranslateState:
     prev = state.get("section", "default")
     new = detect_section_from_chunk(prev, state["chunks"][i])
 
-    # If we've already completed abstract body, force exit after first body chunk
-    if prev == "abstract" and state.get("abstract_completed"):
+    # If we're in abstract and see figure captions, treat following text as non-abstract
+    if prev == "abstract" and is_figure_description_chunk(state["chunks"][i]):
         new = "default"
 
     # Leaving abstract -> finalize "(XXX words)" on last abstract sentence
@@ -299,7 +317,14 @@ def route_after_router(state: TranslateState) -> str:
 
     sec = state.get("section", "default")
     if sec == "claims":
-        return "translate_claims"
+        chunk = state["chunks"][state["i"]]
+        if is_dependent_claim_chunk(chunk):
+            return "translate_claims_dependent"
+        return "translate_claims_independent"
+    if sec == "claims_independent":
+        return "translate_claims_independent"
+    if sec == "claims_dependent":
+        return "translate_claims_dependent"
     if sec == "abstract":
         return "translate_abstract"
     return "translate_default"
@@ -393,6 +418,12 @@ def node_translate_default(state: TranslateState) -> TranslateState:
 def node_translate_claims(state: TranslateState) -> TranslateState:
     return _translate_with_prompt(state, state["prompt_claims"])
 
+def node_translate_claims_independent(state: TranslateState) -> TranslateState:
+    return _translate_with_prompt(state, state["prompt_claims_independent"])
+
+def node_translate_claims_dependent(state: TranslateState) -> TranslateState:
+    return _translate_with_prompt(state, state["prompt_claims_dependent"])
+
 def node_translate_abstract(state: TranslateState) -> TranslateState:
     return _translate_with_prompt(state, state["prompt_abstract"])
 
@@ -407,6 +438,8 @@ def build_translation_graph():
     g.add_node("route_section", node_route_section)
     g.add_node("translate_default", node_translate_default)
     g.add_node("translate_claims", node_translate_claims)
+    g.add_node("translate_claims_independent", node_translate_claims_independent)
+    g.add_node("translate_claims_dependent", node_translate_claims_dependent)
     g.add_node("translate_abstract", node_translate_abstract)
 
     g.set_entry_point("route_section")
@@ -417,6 +450,8 @@ def build_translation_graph():
         {
             "translate_default": "translate_default",
             "translate_claims": "translate_claims",
+            "translate_claims_independent": "translate_claims_independent",
+            "translate_claims_dependent": "translate_claims_dependent",
             "translate_abstract": "translate_abstract",
             END: END,
         },
@@ -424,6 +459,8 @@ def build_translation_graph():
 
     g.add_edge("translate_default", "route_section")
     g.add_edge("translate_claims", "route_section")
+    g.add_edge("translate_claims_independent", "route_section")
+    g.add_edge("translate_claims_dependent", "route_section")
     g.add_edge("translate_abstract", "route_section")
 
     return g.compile()
@@ -482,6 +519,8 @@ def translate_docx(
     api_key: Optional[str] = None,
     prompt_default: str = "patent_kr2en_body_v1",
     prompt_claims: str = "patent_kr2en_claims_v1",
+    prompt_claims_independent: str = "patent_kr2en_claims_independent_v1",
+    prompt_claims_dependent: str = "patent_kr2en_claims_dependent_v1",
     prompt_abstract: str = "patent_kr2en_abstract_v1",
 ) -> None:
     print("Start chunking...")
@@ -518,6 +557,8 @@ def translate_docx(
             "section": "default",
             "prompt_default": prompt_default,
             "prompt_claims": prompt_claims,
+            "prompt_claims_independent": prompt_claims_independent,
+            "prompt_claims_dependent": prompt_claims_dependent,
             "prompt_abstract": prompt_abstract,
 
             "abstract_word_count": 0,

@@ -226,6 +226,49 @@ PROMPT_PATENT_CLAIMS = register_prompt(
 )
 
 
+# Specialized variants for routing nodes
+PROMPT_PATENT_CLAIMS_INDEP = register_prompt(
+    Prompt(
+        name="patent_kr2en_claims_independent_v1",
+        system=(
+            COMMON_SYSTEM
+            + "\n"
+            "HEADING NORMALIZATION RULES:\n"
+            "- Translate '【청구 범위】' (or '【청구범위】') exactly as 'CLAIMS'.\n"
+            + "\n"
+            + CLAIMS_STYLE_RULES
+            + "\n"
+            "NODE ROLE: INDEPENDENT CLAIMS ONLY.\n"
+            "- Treat claims WITHOUT dependencies as independent.\n"
+            "- Ensure the preamble category is clear (method, apparatus, system, device, medium, program, etc.).\n"
+            "- Include each independent claim's category in claim_preambles for downstream dependent claims.\n"
+        ),
+        user=CLAIMS_USER,
+    )
+)
+
+
+PROMPT_PATENT_CLAIMS_DEP = register_prompt(
+    Prompt(
+        name="patent_kr2en_claims_dependent_v1",
+        system=(
+            COMMON_SYSTEM
+            + "\n"
+            "HEADING NORMALIZATION RULES:\n"
+            "- Translate '【청구 범위】' (or '【청구범위】') exactly as 'CLAIMS'.\n"
+            + "\n"
+            + CLAIMS_STYLE_RULES
+            + "\n"
+            "NODE ROLE: DEPENDENT CLAIMS ONLY.\n"
+            "- Identify and preserve dependency references (e.g., 제 1 항에 있어서 / 청구항 1에 따른).\n"
+            "- Start exactly with 'The <category> of claim <M>,' using the category of the referenced independent claim.\n"
+            "- Do NOT invent new independent categories; reuse ESTABLISHED CLAIM PREAMBLES when provided.\n"
+        ),
+        user=CLAIMS_USER,
+    )
+)
+
+
 # ------------------------------------------------------------
 # 3) Abstract node prompt
 # ------------------------------------------------------------
