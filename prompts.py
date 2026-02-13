@@ -155,7 +155,60 @@ CLAIMS_STYLE_RULES = (
     "- Do NOT end with phrases like 'the combination thereof constituting ...'. Put the invention in the preamble.\n"
     "- After a line break, treat the first word of the line as a continuation of the previous clause; "
     "render it in lower-case even if it would normally be capitalized in English.\n"
+    "\n"
+    "D) DEPENDENT CLAIM PREAMBLE RULE (CRITICAL):\n"
+    "- NEVER start a dependent claim with 'wherein claim <M>' or 'Claim <M>, wherein'.\n"
+    "- ALWAYS start with: 'The <category> of claim <M>, wherein ...' or 'The <category> of claim <M>, further comprising ...'.\n"
+    "- The <category> MUST match the category of the independent claim it depends on.\n"
+    "- If ESTABLISHED CLAIM PREAMBLES lists 'Claim 1: method', then claim 5 (depending on 1) MUST start: 'The method of claim 1, ...'\n"
+    "\n"
+    "WRONG examples:\n"
+    "  5. wherein claim 1, the step further comprises ...\n"
+    "  5. Claim 1, wherein ...\n"
+    "CORRECT examples:\n"
+    "  5. The method of claim 1, wherein ...\n"
+    "  5. The method of claim 1, further comprising ...\n"
 )
+
+CLAIMS_USER = (
+    "Translate each JSON item from Korean to ${target_lang} for an English patent application.\n"
+    "\n"
+    "PREVIOUSLY TRANSLATED TEXT (use this to maintain terminology and style consistency):\n"
+    "${prev_translation}\n"
+    "\n"
+    "ESTABLISHED TERMINOLOGY (you MUST reuse these exact English terms for the corresponding Korean terms):\n"
+    "${glossary}\n"
+    "\n"
+    "ESTABLISHED CLAIM PREAMBLES (use these categories for dependent claims):\n"
+    "${claim_preambles}\n"
+    "\n"
+    "SURROUNDING CONTEXT (for reference, do NOT translate these lines directly):\n"
+    "BEFORE:\n${context_before}\n"
+    "AFTER:\n${context_after}\n"
+    "\n"
+    "OUTPUT REQUIREMENTS:\n"
+    "- Return ONLY valid JSON (no markdown, no explanations).\n"
+    "- Use DOUBLE QUOTES for all JSON keys and strings.\n"
+    '- Schema: {"translations":[{"id":"...","text":"..."}], "key_terms":[{"ko":"Korean term","en":"English term"}], "claim_preambles":[{"claim_num":"1","category":"method"}]}\n'
+    "- Keep the same number of items and preserve each id exactly.\n"
+    '- In "key_terms", list all significant technical terms (components, materials, processes, patent-specific noun phrases) you translated in this chunk.\n'
+    "  Do NOT include common words, particles, or grammatical function words.\n"
+    '- In "claim_preambles", for each INDEPENDENT claim you translate, extract the claim number and its category '
+    '(e.g., "method", "apparatus", "system", "device", "medium", "program"). '
+    "Only include independent claims (ones that do NOT reference another claim).\n"
+    "- Output MUST be wrapped exactly like this:\n"
+    "BEGIN_JSON\n"
+    "{...}\n"
+    "END_JSON\n"
+    "\n"
+    "TERM CONSISTENCY INSTRUCTIONS:\n"
+    "- CRITICAL: If a term appears in ESTABLISHED TERMINOLOGY above, you MUST use that exact English translation.\n"
+    "- Use the same English term for the same Korean term across items.\n"
+    "- If an English technical term appears in the source, keep it as-is unless clearly wrong.\n"
+    "\n"
+    "INPUT:\n${payload_json}\n"
+)
+
 
 PROMPT_PATENT_CLAIMS = register_prompt(
     Prompt(
@@ -168,7 +221,7 @@ PROMPT_PATENT_CLAIMS = register_prompt(
             + "\n"
             + CLAIMS_STYLE_RULES
         ),
-        user=COMMON_USER,
+        user=CLAIMS_USER,
     )
 )
 

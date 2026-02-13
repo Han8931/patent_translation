@@ -52,6 +52,9 @@ class TranslateState(TypedDict):
     glossary: Dict[str, str]       # Korean term → English term (accumulated)
     prev_translated_text: str      # English output of the previous chunk
 
+    # cross-chunk context for claim preambles
+    claim_preambles: Dict[str, str]  # claim number → category (e.g. "1" → "method")
+
 
 # ============================================================
 # 1) OpenAI client + JSON extraction fallback
@@ -98,6 +101,31 @@ def _format_glossary(glossary: Dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def _format_claim_preambles(preambles: Dict[str, str]) -> str:
+    if not preambles:
+        return "(none yet — no independent claims translated so far)"
+    lines = [f"Claim {num}: {cat}" for num, cat in sorted(preambles.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0)]
+    return "\n".join(lines)
+
+
+_INDEP_CLAIM_RE = re.compile(
+    r"^\s*(\d+)\.\s+An?\s+(\w+)",
+    re.MULTILINE,
+)
+
+_CATEGORY_WORDS = {"method", "apparatus", "system", "device", "medium", "program", "composition", "compound", "kit", "assembly", "machine", "article", "process", "circuit", "network", "computer", "storage", "structure", "sensor", "module", "unit", "arrangement"}
+
+def extract_claim_preambles(translated_text: str) -> Dict[str, str]:
+    """Regex fallback: extract independent claim preambles from translated English text."""
+    preambles: Dict[str, str] = {}
+    for m in _INDEP_CLAIM_RE.finditer(translated_text):
+        claim_num = m.group(1)
+        category = m.group(2).lower()
+        if category in _CATEGORY_WORDS:
+            preambles[claim_num] = category
+    return preambles
+
+
 def translate_chunk(
     client: OpenAI,
     model: str,
@@ -109,13 +137,15 @@ def translate_chunk(
     context_after: str = "",
     glossary: Dict[str, str] | None = None,
     prev_translated_text: str = "",
-) -> tuple[Dict[str, str], List[Dict[str, str]]]:
-    """Translate a chunk and return (translations, key_terms)."""
+    claim_preambles: Dict[str, str] | None = None,
+) -> tuple[Dict[str, str], List[Dict[str, str]], Dict[str, str]]:
+    """Translate a chunk and return (translations, key_terms, new_claim_preambles)."""
     prompt = PROMPTS[prompt_name]
     payload = [{"id": b.id, "text": b.text} for b in chunk]
 
     glossary_str = _format_glossary(glossary or {})
     prev_translation = prev_translated_text or "(none — this is the first chunk)"
+    preambles_str = _format_claim_preambles(claim_preambles or {})
 
     system_prompt = prompt.system
     user_prompt = prompt.render_user(
@@ -125,6 +155,7 @@ def translate_chunk(
         context_after=context_after,
         glossary=glossary_str,
         prev_translation=prev_translation,
+        claim_preambles=preambles_str,
     )
 
     resp = client.chat.completions.create(
@@ -161,7 +192,20 @@ def translate_chunk(
             if isinstance(term, dict) and "ko" in term and "en" in term:
                 key_terms.append({"ko": str(term["ko"]), "en": str(term["en"])})
 
-    return out, key_terms
+    # Extract claim_preambles from LLM response (primary)
+    new_preambles: Dict[str, str] = {}
+    raw_preambles = data.get("claim_preambles", [])
+    if isinstance(raw_preambles, list):
+        for p in raw_preambles:
+            if isinstance(p, dict) and "claim_num" in p and "category" in p:
+                new_preambles[str(p["claim_num"])] = str(p["category"]).lower()
+
+    # Regex fallback: extract from translated text if LLM didn't provide them
+    if not new_preambles and out:
+        translated_text = "\n".join(out.values())
+        new_preambles = extract_claim_preambles(translated_text)
+
+    return out, key_terms, new_preambles
 
 
 # ============================================================
@@ -268,10 +312,11 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     sec = state.get("section", "default")
     glossary = dict(state.get("glossary", {}))
     prev_translated_text = state.get("prev_translated_text", "")
+    claim_preambles = dict(state.get("claim_preambles", {}))
 
-    print(f"[{sec}] {i}-th chunk... (glossary: {len(glossary)} terms)")
+    print(f"[{sec}] {i}-th chunk... (glossary: {len(glossary)} terms, preambles: {len(claim_preambles)})")
 
-    translated_map, key_terms = translate_chunk(
+    translated_map, key_terms, new_preambles = translate_chunk(
         client=client,
         model=state["model"],
         prompt_name=prompt_name,
@@ -281,6 +326,7 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         context_after=ctx_after,
         glossary=glossary,
         prev_translated_text=prev_translated_text,
+        claim_preambles=claim_preambles,
     )
 
     results = dict(state["results"])
@@ -289,6 +335,9 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     # Accumulate glossary with newly extracted terms
     for term in key_terms:
         glossary[term["ko"]] = term["en"]
+
+    # Accumulate claim preambles
+    claim_preambles.update(new_preambles)
 
     # Build prev_translated_text from this chunk's English output
     new_prev = "\n".join(
@@ -315,6 +364,7 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         "last_abstract_block_id": last_abstract_block_id,
         "glossary": glossary,
         "prev_translated_text": new_prev,
+        "claim_preambles": claim_preambles,
     }
 
 
@@ -457,6 +507,7 @@ def translate_docx(
             # cross-chunk context for terminology consistency
             "glossary": {},
             "prev_translated_text": "",
+            "claim_preambles": {},
         },
         config={"recursion_limit": max(50, len(chunks) * 3)},
     )
