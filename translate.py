@@ -47,6 +47,7 @@ class TranslateState(TypedDict):
     # abstract word-count tracking
     abstract_word_count: int
     last_abstract_block_id: str | None
+    abstract_completed: bool
 
     # cross-chunk context for terminology consistency
     glossary: Dict[str, str]       # Korean term → English term (accumulated)
@@ -269,7 +270,7 @@ def node_route_section(state: TranslateState) -> TranslateState:
         if n > 0 and last_id and last_id in results:
             new_results = dict(results)
             new_results[last_id] = append_word_count_to_last_sentence(new_results[last_id], n)
-            return {**s, "results": new_results}
+            return {**s, "results": new_results, "abstract_completed": True}
         return s
 
     # If we are done, finalize abstract once here
@@ -280,6 +281,10 @@ def node_route_section(state: TranslateState) -> TranslateState:
 
     prev = state.get("section", "default")
     new = detect_section_from_chunk(prev, state["chunks"][i])
+
+    # If we've already processed abstract content, force exit after first abstract body chunk
+    if prev == "abstract" and state.get("abstract_completed"):
+        new = "default"
 
     # Leaving abstract -> finalize "(XXX words)" on last abstract sentence
     if prev == "abstract" and new != "abstract":
@@ -359,6 +364,7 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     # Track abstract word count
     abstract_word_count = int(state.get("abstract_word_count", 0))
     last_abstract_block_id = state.get("last_abstract_block_id")
+    abstract_completed = state.get("abstract_completed", False)
 
     if sec == "abstract":
         for bid, txt in translated_map.items():
@@ -371,6 +377,8 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
             if wc > 0:
                 abstract_word_count += wc
                 last_abstract_block_id = bid
+        if abstract_word_count > 0:
+            abstract_completed = True
 
     return {
         **state,
@@ -378,6 +386,7 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         "i": i + 1,
         "abstract_word_count": abstract_word_count,
         "last_abstract_block_id": last_abstract_block_id,
+        "abstract_completed": abstract_completed,
         "glossary": glossary,
         "prev_translated_text": new_prev,
         "claim_preambles": claim_preambles,
@@ -554,6 +563,7 @@ def translate_docx(
 
             "abstract_word_count": 0,
             "last_abstract_block_id": None,
+            "abstract_completed": False,
 
             # cross-chunk context for terminology consistency
             "glossary": {},
