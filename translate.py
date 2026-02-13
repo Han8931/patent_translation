@@ -230,37 +230,52 @@ def append_word_count_to_last_sentence(text: str, n: int) -> str:
 # 4) Section detection + routing (UPDATED headings)
 # ============================================================
 
+_ABSTRACT_HEADING_RE = re.compile(r"【?\s*요\s*약\s*】?|요약서|초록|ABSTRACT", re.IGNORECASE)
+_CLAIMS_HEADING_RE = re.compile(r"【?\s*청구\s*범위\s*】?|청구항|CLAIMS?", re.IGNORECASE)
+
+
 def _chunk_text(chunk: List[Block]) -> str:
     return "\n".join((b.text or "") for b in chunk)
 
+
 def detect_section_from_chunk(prev: Section, chunk: List[Block]) -> Section:
     """
-    Claims starts with 【청구 범위】 (sometimes without space).
-    Abstract starts with 【요약】.
+    Detect section headings with a few common variants:
+    - Claims: 【청구 범위】, 【청구범위】, 청구항, Claims/CLAIMS
+    - Abstract: 【요약】 plus loose spacing, 요약서, 초록, ABSTRACT
     Sticky behavior: if no heading is found, keep previous section.
     """
     t = _chunk_text(chunk)
 
-    if "【청구" in t :
-        return "claims"
+    m_abs = _ABSTRACT_HEADING_RE.search(t)
+    m_claim = _CLAIMS_HEADING_RE.search(t)
 
-    if "【요약】" in t:
+    if m_abs and m_claim:
+        # Choose the heading that appears first in the chunk
+        return "abstract" if m_abs.start() <= m_claim.start() else "claims"
+    if m_abs:
         return "abstract"
-
+    if m_claim:
+        return "claims"
     return prev
 
 def node_route_section(state: TranslateState) -> TranslateState:
     i = state["i"]
 
+    def finalize_abstract_word_count(s: TranslateState) -> TranslateState:
+        n = int(s.get("abstract_word_count", 0) or 0)
+        last_id = s.get("last_abstract_block_id")
+        results = s.get("results", {})
+        if n > 0 and last_id and last_id in results:
+            new_results = dict(results)
+            new_results[last_id] = append_word_count_to_last_sentence(new_results[last_id], n)
+            return {**s, "results": new_results}
+        return s
+
     # If we are done, finalize abstract once here
     if i >= len(state["chunks"]):
-        if state.get("section") == "abstract":
-            n = int(state.get("abstract_word_count", 0))
-            last_id = state.get("last_abstract_block_id")
-            if n > 0 and last_id and last_id in state["results"]:
-                results = dict(state["results"])
-                results[last_id] = append_word_count_to_last_sentence(results[last_id], n)
-                return {**state, "results": results}
+        if state.get("section") == "abstract" or state.get("abstract_word_count", 0):
+            return finalize_abstract_word_count(state)
         return state
 
     prev = state.get("section", "default")
@@ -268,13 +283,10 @@ def node_route_section(state: TranslateState) -> TranslateState:
 
     # Leaving abstract -> finalize "(XXX words)" on last abstract sentence
     if prev == "abstract" and new != "abstract":
-        n = int(state.get("abstract_word_count", 0))
-        last_id = state.get("last_abstract_block_id")
-        if last_id and last_id in state["results"]:
-            results = dict(state["results"])
-            results[last_id] = append_word_count_to_last_sentence(results[last_id], n)
-            print(f"[ABSTRACT] finalize word count: {n} words")
-            state = {**state, "results": results}
+        finalized = finalize_abstract_word_count(state)
+        if finalized is not state:
+            print(f"[ABSTRACT] finalize word count: {finalized.get('abstract_word_count', 0)} words")
+            state = finalized
 
     if new != prev:
         print(f"[ROUTE] chunk {i}: {prev} -> {new}")
@@ -351,9 +363,11 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     if sec == "abstract":
         for bid, txt in translated_map.items():
             t = (txt or "").strip()
-            if t.upper() == "ABSTRACT":
+            # Drop leading heading if the model left it attached.
+            t_no_heading = re.sub(r"^ABSTRACT[:\s\-]*", "", t, flags=re.IGNORECASE)
+            if t_no_heading.upper() == "ABSTRACT":
                 continue
-            wc = count_english_words(t)
+            wc = count_english_words(t_no_heading)
             if wc > 0:
                 abstract_word_count += wc
                 last_abstract_block_id = bid
@@ -514,21 +528,9 @@ def translate_docx(
         config={"recursion_limit": max(50, len(chunks) * 3)},
     )
 
-    # If the document ends while still in abstract, finalize too
-    if final.get("section") == "abstract":
-        # n = int(final.get("abstract_word_count", 0))
-        # last_id = final.get("last_abstract_block_id")
-        # if last_id and last_id in final["results"]:
-        #     final["results"][last_id] = append_word_count_to_last_sentence(final["results"][last_id], n)
-        #     print(f"[ABSTRACT] finalize word count at end: {n} words")
-
-        # Always finalize if we ever saw abstract blocks
-        n = int(final.get("abstract_word_count", 0))
-        last_id = final.get("last_abstract_block_id")
-
-        if n > 0 and last_id and last_id in final["results"]:
-            final["results"][last_id] = append_word_count_to_last_sentence(final["results"][last_id], n)
-            print(f"[ABSTRACT] finalize word count: {n} words")
+    # If the document ends while still in abstract (or word count exists), finalize again defensively
+    if final.get("abstract_word_count", 0) or final.get("section") == "abstract":
+        final = node_route_section({**final, "i": len(chunks)})
 
 
     print("Apply translations...")
