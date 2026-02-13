@@ -262,3 +262,38 @@ PROMPT_PATENT_ABSTRACT = register_prompt(
 
 # Optional: keep your old name as an alias to the default/body prompt
 PROMPTS["translate_kr_patent_to_en_v1"] = PROMPT_PATENT_BODY
+
+
+# ------------------------------------------------------------
+# 4) Claims (independent / dependent split, lighter prompts)
+# ------------------------------------------------------------
+
+
+PROMPT_PATENT_CLAIMS_INDEP = register_prompt(
+    Prompt(
+        name="patent_kr2en_claims_indep_v1",
+        system=(
+            COMMON_SYSTEM
+            + "\n"
+            "SECTION: CLAIMS — INDEPENDENT\n"
+            "Use single-sentence claim style. Preamble pattern: 'A <category> performed by <actor>, the <category> comprising:'.\n"
+            "Use gerunds for elements/steps. Keep antecedent basis. Preserve claim number."
+        ),
+        user=CLAIMS_USER,
+    )
+)
+
+
+PROMPT_PATENT_CLAIMS_DEP = register_prompt(
+    Prompt(
+        name="patent_kr2en_claims_dep_v1",
+        system=(
+            COMMON_SYSTEM
+            + "\n"
+            "SECTION: CLAIMS — DEPENDENT\n"
+            "Start exactly: 'The <category> of claim <M>, ...'.\n"
+            "Use one sentence; use 'wherein' clauses for limitations; keep claim numbers and dependencies."
+        ),
+        user=CLAIMS_USER,
+    )
+)

@@ -300,7 +300,7 @@ def route_after_router(state: TranslateState) -> str:
 
     sec = state.get("section", "default")
     if sec == "claims":
-        return "translate_claims"
+        return "classify_claims"
     if sec == "abstract":
         return "translate_abstract"
     return "translate_default"
@@ -390,6 +390,29 @@ def node_translate_default(state: TranslateState) -> TranslateState:
 def node_translate_claims(state: TranslateState) -> TranslateState:
     return _translate_with_prompt(state, state["prompt_claims"])
 
+
+# New: classify claim chunks as independent/dependent and route to specialized prompts
+def classify_claims(state: TranslateState) -> str:
+    i = state.get("i", 0)
+    if i >= len(state.get("chunks", [])):
+        return "translate_claims_indep"  # fallback
+
+    chunk = state["chunks"][i]
+    text = "\n".join((b.text or "") for b in chunk)
+
+    # Simple heuristic: if the chunk references another claim (제 <num> 항 or "claim <num>") treat as dependent
+    if re.search(r"제\s*\d+\s*항", text) or re.search(r"claim\s+\d+", text, re.IGNORECASE):
+        return "translate_claims_dep"
+    return "translate_claims_indep"
+
+
+def node_translate_claims_indep(state: TranslateState) -> TranslateState:
+    return _translate_with_prompt(state, state.get("prompt_claims_indep", "patent_kr2en_claims_indep_v1"))
+
+
+def node_translate_claims_dep(state: TranslateState) -> TranslateState:
+    return _translate_with_prompt(state, state.get("prompt_claims_dep", "patent_kr2en_claims_dep_v1"))
+
 def node_translate_abstract(state: TranslateState) -> TranslateState:
     return _translate_with_prompt(state, state["prompt_abstract"])
 
@@ -403,7 +426,10 @@ def build_translation_graph():
 
     g.add_node("route_section", node_route_section)
     g.add_node("translate_default", node_translate_default)
-    g.add_node("translate_claims", node_translate_claims)
+    g.add_node("classify_claims", classify_claims)
+    g.add_node("translate_claims", node_translate_claims)  # legacy fallback
+    g.add_node("translate_claims_indep", node_translate_claims_indep)
+    g.add_node("translate_claims_dep", node_translate_claims_dep)
     g.add_node("translate_abstract", node_translate_abstract)
 
     g.set_entry_point("route_section")
@@ -413,7 +439,10 @@ def build_translation_graph():
         route_after_router,
         {
             "translate_default": "translate_default",
+            "classify_claims": "classify_claims",
             "translate_claims": "translate_claims",
+            "translate_claims_indep": "translate_claims_indep",
+            "translate_claims_dep": "translate_claims_dep",
             "translate_abstract": "translate_abstract",
             END: END,
         },
@@ -421,6 +450,8 @@ def build_translation_graph():
 
     g.add_edge("translate_default", "route_section")
     g.add_edge("translate_claims", "route_section")
+    g.add_edge("translate_claims_indep", "route_section")
+    g.add_edge("translate_claims_dep", "route_section")
     g.add_edge("translate_abstract", "route_section")
 
     return g.compile()
@@ -479,6 +510,8 @@ def translate_docx(
     api_key: Optional[str] = None,
     prompt_default: str = "patent_kr2en_body_v1",
     prompt_claims: str = "patent_kr2en_claims_v1",
+    prompt_claims_indep: str = "patent_kr2en_claims_indep_v1",
+    prompt_claims_dep: str = "patent_kr2en_claims_dep_v1",
     prompt_abstract: str = "patent_kr2en_abstract_v1",
 ) -> None:
     print("Start chunking...")
@@ -515,6 +548,8 @@ def translate_docx(
             "section": "default",
             "prompt_default": prompt_default,
             "prompt_claims": prompt_claims,
+            "prompt_claims_indep": prompt_claims_indep,
+            "prompt_claims_dep": prompt_claims_dep,
             "prompt_abstract": prompt_abstract,
 
             "abstract_word_count": 0,
