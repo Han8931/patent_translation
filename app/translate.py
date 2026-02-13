@@ -11,20 +11,21 @@ from docx import Document
 from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
-from chunking import (
+from app.batch_tools.chunking import (
     Block,
     BlockType,
     iter_blocks,
     chunk_blocks_with_spans,
     build_contexts,
 )
-from prompts import PROMPTS
+from app.batch_tools.prompts import PROMPTS
 
 # ============================================================
 # 0) Types
 # ============================================================
 
 Section = Literal["default", "claims", "claims_independent", "claims_dependent", "abstract"]
+
 
 class TranslateState(TypedDict):
     chunks: List[List[Block]]
@@ -107,16 +108,25 @@ def _format_glossary(glossary: Dict[str, str]) -> str:
 def _format_claim_preambles(preambles: Dict[str, str]) -> str:
     if not preambles:
         return "(none yet — no independent claims translated so far)"
-    lines = [f"Claim {num}: {cat}" for num, cat in sorted(preambles.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0)]
+    lines = [
+        f"Claim {num}: {cat}"
+        for num, cat in sorted(
+            preambles.items(),
+            key=lambda x: int(x[0]) if x[0].isdigit() else 0
+        )
+    ]
     return "\n".join(lines)
 
 
-_INDEP_CLAIM_RE = re.compile(
-    r"^\s*(\d+)\.\s+An?\s+(\w+)",
-    re.MULTILINE,
-)
+_INDEP_CLAIM_RE = re.compile(r"^\s*(\d+)\.\s+An?\s+(\w+)", re.MULTILINE)
 
-_CATEGORY_WORDS = {"method", "apparatus", "system", "device", "medium", "program", "composition", "compound", "kit", "assembly", "machine", "article", "process", "circuit", "network", "computer", "storage", "structure", "sensor", "module", "unit", "arrangement"}
+_CATEGORY_WORDS = {
+    "method", "apparatus", "system", "device", "medium", "program",
+    "composition", "compound", "kit", "assembly", "machine", "article",
+    "process", "circuit", "network", "computer", "storage", "structure",
+    "sensor", "module", "unit", "arrangement",
+}
+
 
 def extract_claim_preambles(translated_text: str) -> Dict[str, str]:
     """Regex fallback: extract independent claim preambles from translated English text."""
@@ -212,7 +222,7 @@ def translate_chunk(
 
 
 # ============================================================
-# 3) Abstract word counting + finalization (NEW)
+# 3) Abstract word counting + finalization
 # ============================================================
 
 _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
@@ -230,7 +240,7 @@ def append_word_count_to_last_sentence(text: str, n: int) -> str:
 
 
 # ============================================================
-# 4) Section detection + routing (UPDATED headings)
+# 4) Section detection + routing
 # ============================================================
 
 def _chunk_text(chunk: List[Block]) -> str:
@@ -239,38 +249,44 @@ def _chunk_text(chunk: List[Block]) -> str:
 def detect_section_from_chunk(prev: Section, chunk: List[Block]) -> Section:
     """
     Claims starts with 【청구 범위】 (sometimes without space).
-    Abstract starts with 【요약】.
+    Abstract starts with 【요약】, but many KR docs also have 【요약서】.
     Sticky behavior: if no heading is found, keep previous section.
     """
-    if prev == "abstract":
-        return "abstract"  # let caller handle exit timing
-
     t = _chunk_text(chunk)
 
+    # If we're already in abstract, keep it sticky (caller decides exit timing)
+    if prev == "abstract":
+        return "abstract"
+
+    # Claims
     if "【청구" in t:
         return "claims"
 
-    if "【요약】" in t:
+    # Abstract: match 【요약】 and 【요약서】 and similar forms
+    if "【요약" in t:
         return "abstract"
 
     return prev
 
 
 _DEP_CLAIM_RE = re.compile(r"(청구항\s*\d+|제\s*\d+\s*항)\s*(에\s*따른|에\s*따라|에\s*있어서|의)")
-_FIGURE_RE = re.compile(r"(도\s*\d+[A-Za-z]?|FIG\.\s*\d+|도면의\s*간단한\s*설명)")
+# Abstract-ending / non-abstract markers (대표도 + FIG lines)
+_FIGURE_RE = re.compile(
+    r"(【\s*대표도\s*】|대표도|도\s*\d+[A-Za-z]?|FIG\.\s*\d+|도면의\s*간단한\s*설명)"
+)
 
 def is_dependent_claim_chunk(chunk: List[Block]) -> bool:
     t = _chunk_text(chunk)
     return bool(_DEP_CLAIM_RE.search(t))
 
-
 def is_figure_description_chunk(chunk: List[Block]) -> bool:
     """
-    Heuristic: figure captions or brief description of drawings often follow the abstract.
+    Heuristic: 대표도 / 도 1 / FIG. 1 / brief description of drawings often follow the abstract.
     If detected, we should exit the abstract section to avoid counting their words.
     """
     t = _chunk_text(chunk)
     return bool(_FIGURE_RE.search(t))
+
 
 def node_route_section(state: TranslateState) -> TranslateState:
     i = state["i"]
@@ -294,7 +310,7 @@ def node_route_section(state: TranslateState) -> TranslateState:
     prev = state.get("section", "default")
     new = detect_section_from_chunk(prev, state["chunks"][i])
 
-    # If we're in abstract and see figure captions, treat following text as non-abstract
+    # If we're in abstract and see representative-figure / drawing markers, exit abstract
     if prev == "abstract" and is_figure_description_chunk(state["chunks"][i]):
         new = "default"
 
@@ -376,9 +392,7 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     claim_preambles.update(new_preambles)
 
     # Build prev_translated_text from this chunk's English output
-    new_prev = "\n".join(
-        translated_map.get(b.id, b.text) for b in chunk
-    )
+    new_prev = "\n".join(translated_map.get(b.id, b.text) for b in chunk)
 
     # Track abstract word count
     abstract_word_count = int(state.get("abstract_word_count", 0))
@@ -388,14 +402,25 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     if sec == "abstract":
         for bid, txt in translated_map.items():
             t = (txt or "").strip()
-            # Drop leading heading if the model left it attached.
-            t_no_heading = re.sub(r"^ABSTRACT[:\\s\\-]*", "", t, flags=re.IGNORECASE)
-            if t_no_heading.upper() == "ABSTRACT":
+
+            # Remove ABSTRACT heading if model attaches it
+            t_no_heading = re.sub(r"^ABSTRACT[:\s\-]*", "", t, flags=re.IGNORECASE).strip()
+
+            # Skip pure heading lines
+            if not t_no_heading or t_no_heading.upper() == "ABSTRACT":
                 continue
+
+            # Skip 대표도/FIG captions from word count (common end-of-doc pattern)
+            if re.match(r"^(REPRESENTATIVE\s+FIGURE)\b", t_no_heading, flags=re.IGNORECASE):
+                continue
+            if re.match(r"^(FIG\.)\s*\d+", t_no_heading, flags=re.IGNORECASE):
+                continue
+
             wc = count_english_words(t_no_heading)
             if wc > 0:
                 abstract_word_count += wc
                 last_abstract_block_id = bid
+
         if abstract_word_count > 0:
             abstract_completed = True
 
@@ -429,7 +454,7 @@ def node_translate_abstract(state: TranslateState) -> TranslateState:
 
 
 # ============================================================
-# 6) Build graph (router -> specialized translate -> router ...)
+# 6) Build graph
 # ============================================================
 
 def build_translation_graph():
@@ -565,7 +590,6 @@ def translate_docx(
             "last_abstract_block_id": None,
             "abstract_completed": False,
 
-            # cross-chunk context for terminology consistency
             "glossary": {},
             "prev_translated_text": "",
             "claim_preambles": {},
@@ -573,10 +597,9 @@ def translate_docx(
         config={"recursion_limit": max(50, len(chunks) * 3)},
     )
 
-    # If the document ends while still in abstract (or word count exists), finalize again defensively
+    # Defensive finalization: if document ends while in abstract (or word count exists), finalize
     if final.get("abstract_word_count", 0) or final.get("section") == "abstract":
         final = node_route_section({**final, "i": len(chunks)})
-
 
     print("Apply translations...")
     apply_translations_to_docx(src_docx_path, final["results"], out_docx_path)

@@ -22,6 +22,7 @@ class Prompt:
 
 PROMPTS: Dict[str, Prompt] = {}
 
+
 def register_prompt(p: Prompt) -> Prompt:
     PROMPTS[p.name] = p
     return p
@@ -47,6 +48,7 @@ COMMON_SYSTEM = (
     "- Translate the Korean heading '【요약】' exactly as 'ABSTRACT'.\n"
     "- Translate the Korean heading '【청구 범위】' (or '【청구범위】') exactly as 'CLAIMS'.\n"
     "- Keep the brackets【】out in English headings (output 'ABSTRACT' / 'CLAIMS' as plain text).\n"
+    "\n"
     "GLOBAL STYLE RULES (English patent drafting):\n"
     "- Use formal, clear, objective tone.\n"
     "- Prefer 'comprising' style when listing elements.\n"
@@ -118,10 +120,39 @@ PROMPT_PATENT_BODY = register_prompt(
 # 2) Claims node prompt
 # ------------------------------------------------------------
 
+CLAIMS_LINEBREAK_RECONSTRUCTION = (
+    "LINE-BREAK RECONSTRUCTION (CRITICAL FOR CLAIMS):\n"
+    "- The Korean claim text may be broken across multiple lines for formatting.\n"
+    "- You MUST treat all lines within the same JSON item as ONE continuous claim.\n"
+    "- Do NOT translate each line as if it were a standalone sentence.\n"
+    "- Instead, reconstruct the claim into proper English patent-claim form.\n"
+    "\n"
+    "DEPENDENT CLAIM RECONSTRUCTION:\n"
+    "- If you see '청구항 <M>에 있어서' / '제 <M> 항에 있어서' / '청구항 <M>에 따른',\n"
+    "  the English MUST begin exactly with:\n"
+    "  'The <category> of claim <M>,'\n"
+    "- NEVER output 'wherein claim <M>' or 'Claim <M>, wherein'.\n"
+    "\n"
+    "STRUCTURAL LINES (DO NOT TRANSLATE LITERALLY):\n"
+    "- Lines like '상기 방법은,' / '상기 장치는,' / '상기 시스템은,' often indicate the category and transition.\n"
+    "- If such a line precedes a list of steps/elements, use:\n"
+    "  'further comprising:' (preferred) or 'comprising:' before listing.\n"
+    "\n"
+    "STEP LINES:\n"
+    "- Patterns like '~하는 동작,' / '~하는 단계,' should be rendered as gerund steps\n"
+    "  (e.g., 'transmitting ...', 'receiving ...') within the same claim sentence.\n"
+    "\n"
+    "BAD OUTPUT PATTERN (DO NOT DO THIS):\n"
+    "  'wherein claim 12,\\n the method,\\n transmitting ...'\n"
+    "GOOD OUTPUT PATTERN:\n"
+    "  'The method of claim 12, further comprising: transmitting ...; and ... .'\n"
+)
 
 CLAIMS_STYLE_RULES = (
     "CLAIMS STYLE (MATCH THESE EXAMPLES):\n"
     "\n"
+    + CLAIMS_LINEBREAK_RECONSTRUCTION
+    + "\n"
     "A) INDEPENDENT CLAIMS (example pattern):\n"
     "<N>. A <category> performed by <actor>, the <category> comprising:\n"
     "  <step/element 1>; and\n"
@@ -153,8 +184,6 @@ CLAIMS_STYLE_RULES = (
     "- Use 'wherein' (not 'where') for claim limitations.\n"
     "- Do NOT add new limitations. Do NOT broaden or narrow scope.\n"
     "- Do NOT end with phrases like 'the combination thereof constituting ...'. Put the invention in the preamble.\n"
-    "- After a line break, treat the first word of the line as a continuation of the previous clause; "
-    "render it in lower-case even if it would normally be capitalized in English.\n"
     "\n"
     "D) DEPENDENT CLAIM PREAMBLE RULE (CRITICAL):\n"
     "- NEVER start a dependent claim with 'wherein claim <M>' or 'Claim <M>, wherein'.\n"
@@ -209,6 +238,14 @@ CLAIMS_USER = (
     "INPUT:\n${payload_json}\n"
 )
 
+CLAIMS_SYSTEM_OVERRIDE = (
+    "\n"
+    "CLAIMS OVERRIDE:\n"
+    "- Ignore the global 'lower-case after line break' rule for CLAIMS.\n"
+    "- In CLAIMS, line breaks are formatting only; rebuild the claim into correct legal English structure.\n"
+    "- Treat each JSON item as ONE claim sentence; reconstruct preambles and transitions as needed.\n"
+)
+
 
 PROMPT_PATENT_CLAIMS = register_prompt(
     Prompt(
@@ -220,6 +257,7 @@ PROMPT_PATENT_CLAIMS = register_prompt(
             "- Translate '【청구 범위】' (or '【청구범위】') exactly as 'CLAIMS'.\n"
             + "\n"
             + CLAIMS_STYLE_RULES
+            + CLAIMS_SYSTEM_OVERRIDE
         ),
         user=CLAIMS_USER,
     )
@@ -237,6 +275,7 @@ PROMPT_PATENT_CLAIMS_INDEP = register_prompt(
             "- Translate '【청구 범위】' (or '【청구범위】') exactly as 'CLAIMS'.\n"
             + "\n"
             + CLAIMS_STYLE_RULES
+            + CLAIMS_SYSTEM_OVERRIDE
             + "\n"
             "NODE ROLE: INDEPENDENT CLAIMS ONLY.\n"
             "- Treat claims WITHOUT dependencies as independent.\n"
@@ -258,6 +297,7 @@ PROMPT_PATENT_CLAIMS_DEP = register_prompt(
             "- Translate '【청구 범위】' (or '【청구범위】') exactly as 'CLAIMS'.\n"
             + "\n"
             + CLAIMS_STYLE_RULES
+            + CLAIMS_SYSTEM_OVERRIDE
             + "\n"
             "NODE ROLE: DEPENDENT CLAIMS ONLY.\n"
             "- Identify and preserve dependency references (e.g., 제 1 항에 있어서 / 청구항 1에 따른).\n"
@@ -291,7 +331,6 @@ PROMPT_PATENT_ABSTRACT = register_prompt(
         user=COMMON_USER,
     )
 )
-
 
 
 # Optional: keep your old name as an alias to the default/body prompt
