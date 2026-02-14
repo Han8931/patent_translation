@@ -60,6 +60,10 @@ class TranslateState(TypedDict):
     abstract_word_count: int
     last_abstract_block_id: str | None
     abstract_completed: bool  # marks that we've seen abstract body text
+    abstract_block_ids: List[str]
+    abstract_target_words: int
+    abstract_word_tolerance: int
+    abstract_rewritten: bool
 
     # cross-chunk context for terminology consistency
     glossary: Dict[str, str]       # Korean term → English term (accumulated)
@@ -160,6 +164,7 @@ def translate_chunk(
     glossary: Dict[str, str] | None = None,
     prev_translated_text: str = "",
     claim_preambles: Dict[str, str] | None = None,
+    abstract_target_words: int = 0,
 ) -> tuple[Dict[str, str], List[Dict[str, str]], Dict[str, str]]:
     """Translate a chunk and return (translations, key_terms, new_claim_preambles)."""
     prompt = PROMPTS[prompt_name]
@@ -179,6 +184,12 @@ def translate_chunk(
         prev_translation=prev_translation,
         claim_preambles=preambles_str,
     )
+    if abstract_target_words > 0 and "abstract" in prompt_name:
+        user_prompt += (
+            "\nADDITIONAL ABSTRACT CONSTRAINT:\n"
+            f"- Target exactly {abstract_target_words} English words for the abstract body text.\n"
+            "- Do not include headings in the count.\n"
+        )
 
     resp = client.chat.completions.create(
         model=model,
@@ -248,6 +259,41 @@ def append_word_count_to_last_sentence(text: str, n: int) -> str:
     return f"{s} ({n} words)"
 
 
+def _strip_abstract_heading(text: str) -> str:
+    return re.sub(r"^ABSTRACT[:\s\-]*", "", (text or "").strip(), flags=re.IGNORECASE).strip()
+
+
+def _call_abstract_rewrite(
+    *,
+    client: OpenAI,
+    model: str,
+    abstract_text: str,
+    target_words: int,
+) -> str:
+    system_prompt = (
+        "You are a patent abstract editor. Rewrite for legal-faithful clarity.\n"
+        "Return only the rewritten abstract text without markdown, labels, or explanations."
+    )
+    user_prompt = (
+        f"Rewrite the following abstract to be exactly {target_words} English words.\n"
+        "Keep technical meaning and scope unchanged.\n"
+        "Do not add numbering, headings, or commentary.\n\n"
+        f"ABSTRACT:\n{abstract_text}"
+    )
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.0,
+    )
+    out = (resp.choices[0].message.content or "").strip()
+    out = re.sub(r"^```(?:text)?\s*", "", out, flags=re.IGNORECASE).strip()
+    out = re.sub(r"\s*```$", "", out).strip()
+    return _strip_abstract_heading(out)
+
+
 # ============================================================
 # 4) Section detection + routing
 # ============================================================
@@ -304,11 +350,58 @@ def node_route_section(state: TranslateState) -> TranslateState:
         n = int(s.get("abstract_word_count", 0) or 0)
         last_id = s.get("last_abstract_block_id")
         results = s.get("results", {})
-        if n > 0 and last_id and last_id in results:
-            new_results = dict(results)
+        abstract_ids = list(s.get("abstract_block_ids", []))
+        target = int(s.get("abstract_target_words", 0) or 0)
+        tol = int(s.get("abstract_word_tolerance", 0) or 0)
+        rewritten = bool(s.get("abstract_rewritten", False))
+
+        new_results = dict(results)
+
+        # Enforce target words with a rewrite pass when configured.
+        if (
+            target > 0
+            and not rewritten
+            and abstract_ids
+            and abs(n - target) > tol
+        ):
+            combined = "\n".join(
+                _strip_abstract_heading(new_results.get(bid, ""))
+                for bid in abstract_ids
+                if (new_results.get(bid, "") or "").strip()
+            ).strip()
+            if combined:
+                try:
+                    client = make_client(s.get("base_url"), s.get("api_key"))
+                    rewritten_text = _call_abstract_rewrite(
+                        client=client,
+                        model=s["model"],
+                        abstract_text=combined,
+                        target_words=target,
+                    )
+                    if rewritten_text:
+                        # Keep abstract as a single coherent paragraph on the last abstract id.
+                        for bid in abstract_ids:
+                            if bid != last_id:
+                                new_results[bid] = ""
+                        if last_id:
+                            new_results[last_id] = rewritten_text
+                        n = count_english_words(rewritten_text)
+                        rewritten = True
+                        print(f"[ABSTRACT] rewrite applied: {n} words (target={target}, tol={tol})")
+                except Exception as e:
+                    print(f"[ABSTRACT] rewrite skipped due to error: {e}")
+
+        if n > 0 and last_id and last_id in new_results:
             new_results[last_id] = append_word_count_to_last_sentence(new_results[last_id], n)
-            return {**s, "results": new_results, "abstract_completed": True}
-        return s
+            return {
+                **s,
+                "results": new_results,
+                "abstract_completed": True,
+                "abstract_word_count": n,
+                "abstract_rewritten": rewritten,
+            }
+
+        return {**s, "results": new_results, "abstract_rewritten": rewritten}
 
     # If we are done, finalize abstract once here
     if i >= len(state["chunks"]):
@@ -374,6 +467,7 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     glossary = dict(state.get("glossary", {}))
     prev_translated_text = state.get("prev_translated_text", "")
     claim_preambles = dict(state.get("claim_preambles", {}))
+    abstract_target_words = int(state.get("abstract_target_words", 0) or 0)
 
     print(f"[{sec}] {i}-th chunk... (glossary: {len(glossary)} terms, preambles: {len(claim_preambles)})")
 
@@ -388,6 +482,7 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         glossary=glossary,
         prev_translated_text=prev_translated_text,
         claim_preambles=claim_preambles,
+        abstract_target_words=abstract_target_words,
     )
 
     results = dict(state["results"])
@@ -407,9 +502,12 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     abstract_word_count = int(state.get("abstract_word_count", 0))
     last_abstract_block_id = state.get("last_abstract_block_id")
     abstract_completed = state.get("abstract_completed", False)
+    abstract_block_ids = list(state.get("abstract_block_ids", []))
 
     if sec == "abstract":
-        for bid, txt in translated_map.items():
+        for b in chunk:
+            bid = b.id
+            txt = translated_map.get(bid, "")
             t = (txt or "").strip()
 
             # Remove ABSTRACT heading if model attaches it
@@ -429,6 +527,8 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
             if wc > 0:
                 abstract_word_count += wc
                 last_abstract_block_id = bid
+                if bid not in abstract_block_ids:
+                    abstract_block_ids.append(bid)
 
         if abstract_word_count > 0:
             abstract_completed = True
@@ -440,6 +540,7 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         "abstract_word_count": abstract_word_count,
         "last_abstract_block_id": last_abstract_block_id,
         "abstract_completed": abstract_completed,
+        "abstract_block_ids": abstract_block_ids,
         "glossary": glossary,
         "prev_translated_text": new_prev,
         "claim_preambles": claim_preambles,
@@ -685,6 +786,8 @@ def translate_docx(
     context_chars: int = 1000,
     chunk_overlap: int = 0,
     layout_mode: LayoutMode = "relaxed",
+    abstract_target_words: int = 0,
+    abstract_word_tolerance: int = 5,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     prompt_default: str = "patent_kr2en_body_v1",
@@ -738,6 +841,10 @@ def translate_docx(
             "abstract_word_count": 0,
             "last_abstract_block_id": None,
             "abstract_completed": False,
+            "abstract_block_ids": [],
+            "abstract_target_words": abstract_target_words,
+            "abstract_word_tolerance": abstract_word_tolerance,
+            "abstract_rewritten": False,
 
             "glossary": {},
             "prev_translated_text": "",

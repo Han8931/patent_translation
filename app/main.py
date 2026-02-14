@@ -73,6 +73,8 @@ async def translate_one(
                 context_chars=1000,
                 chunk_overlap=0,
                 layout_mode="relaxed",
+                abstract_target_words=150,
+                abstract_word_tolerance=5,
                 base_url=llm_config.GPT_OSS_URL_API,
                 api_key=llm_config.GPT_OSS_API_KEY,
                 prompt_default="patent_kr2en_body_v1",
@@ -107,4 +109,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
