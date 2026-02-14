@@ -3,9 +3,6 @@ import boto3
 
 from docx import Document
 from pathlib import Path
-from fastapi import HTTPException
-
-from botocore.exceptions import BotoCoreError, ClientError
 
 S3_DRIVE = "http://s3.dataplatform.samsungds.net:9020"
 FILE_DOWNLOAD_DIR = Path("./uploads/")
@@ -52,7 +49,25 @@ def load_filename_list(file_path: Path) -> list[str]:
 
     return out
 
-def download_s3_file(filepath: str, bucket: "Bucket") -> Path:
+def list_local_docx_files(documents_dir: str | Path) -> list[str]:
+    base = Path(documents_dir)
+    if not base.exists():
+        return []
+    return sorted(p.name for p in base.glob("*.docx") if p.is_file())
+
+
+def resolve_local_file(filepath: str | Path, documents_dir: str | Path = "./documents") -> Path:
+    p = Path(filepath)
+    if p.is_absolute() and p.exists():
+        return p
+    candidate = Path(documents_dir) / p.name
+    if candidate.exists():
+        return candidate
+    raise FileNotFoundError(f"Local document not found: {candidate}")
+
+
+def download_s3_file(filepath: str | Path, bucket: "Bucket") -> Path:
+    src = Path(filepath)
     client = boto3.client(
         "s3",
         aws_access_key_id=str(bucket.access_key.get_secret_value()),
@@ -60,7 +75,7 @@ def download_s3_file(filepath: str, bucket: "Bucket") -> Path:
         endpoint_url=S3_DRIVE,
     )
 
-    filename = filepath.name
+    filename = src.name
     path = FILE_DOWNLOAD_DIR / filename
 
     # Ensure directory exists
@@ -68,7 +83,7 @@ def download_s3_file(filepath: str, bucket: "Bucket") -> Path:
 
     client.download_file(
             Bucket=bucket.name, 
-            Key=str(filepath), 
+            Key=str(src), 
             Filename=str(path)
         )
 

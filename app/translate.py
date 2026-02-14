@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, List, Dict, Literal, Optional
 
@@ -11,24 +12,32 @@ from docx import Document
 from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
-from app.batch_tools.chunking import (
+from app.chunking import (
     Block,
     BlockType,
     iter_blocks,
     chunk_blocks_with_spans,
     build_contexts,
 )
-from app.batch_tools.prompts import PROMPTS
+from app.prompts import PROMPTS
 
 # ============================================================
 # 0) Types
 # ============================================================
 
 Section = Literal["default", "claims", "claims_independent", "claims_dependent", "abstract"]
+LayoutMode = Literal["strict", "relaxed", "balanced"]
+
+
+@dataclass(frozen=True)
+class TranslationUnit:
+    id: str
+    kind: BlockType
+    text: str
 
 
 class TranslateState(TypedDict):
-    chunks: List[List[Block]]
+    chunks: List[List[TranslationUnit]]
     contexts: List[Dict[str, str]]
     i: int
     results: Dict[str, str]
@@ -145,7 +154,7 @@ def translate_chunk(
     *,
     prompt_name: str,
     target_lang: str,
-    chunk: List[Block],
+    chunk: List[TranslationUnit],
     context_before: str = "",
     context_after: str = "",
     glossary: Dict[str, str] | None = None,
@@ -243,10 +252,10 @@ def append_word_count_to_last_sentence(text: str, n: int) -> str:
 # 4) Section detection + routing
 # ============================================================
 
-def _chunk_text(chunk: List[Block]) -> str:
+def _chunk_text(chunk: List[TranslationUnit]) -> str:
     return "\n".join((b.text or "") for b in chunk)
 
-def detect_section_from_chunk(prev: Section, chunk: List[Block]) -> Section:
+def detect_section_from_chunk(prev: Section, chunk: List[TranslationUnit]) -> Section:
     """
     Claims starts with 【청구 범위】 (sometimes without space).
     Abstract starts with 【요약】, but many KR docs also have 【요약서】.
@@ -275,11 +284,11 @@ _FIGURE_RE = re.compile(
     r"(【\s*대표도\s*】|대표도|도\s*\d+[A-Za-z]?|FIG\.\s*\d+|도면의\s*간단한\s*설명)"
 )
 
-def is_dependent_claim_chunk(chunk: List[Block]) -> bool:
+def is_dependent_claim_chunk(chunk: List[TranslationUnit]) -> bool:
     t = _chunk_text(chunk)
     return bool(_DEP_CLAIM_RE.search(t))
 
-def is_figure_description_chunk(chunk: List[Block]) -> bool:
+def is_figure_description_chunk(chunk: List[TranslationUnit]) -> bool:
     """
     Heuristic: 대표도 / 도 1 / FIG. 1 / brief description of drawings often follow the abstract.
     If detected, we should exit the abstract section to avoid counting their words.
@@ -492,7 +501,142 @@ def build_translation_graph():
 
 
 # ============================================================
-# 7) Apply translations back into DOCX
+# 7) Translation units + writeback mapping
+# ============================================================
+
+_HEADING_RE = re.compile(r"^\s*【[^】]+】\s*$")
+_CLAIM_NUMBER_LINE_RE = re.compile(r"^\s*\d+\s*[\.\)]")
+_LIST_PREFIX_RE = re.compile(r"^\s*[-*•]\s+")
+_HARD_SENTENCE_END_RE = re.compile(r"[.!?;:]\s*$")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;:])\s+")
+
+
+def _same_table_cell(a: Block, b: Block) -> bool:
+    if not (a.id.startswith("cell:") and b.id.startswith("cell:")):
+        return False
+    a_parts = a.id.split(":")
+    b_parts = b.id.split(":")
+    if len(a_parts) != 5 or len(b_parts) != 5:
+        return False
+    return a_parts[:4] == b_parts[:4]
+
+
+def _can_merge_blocks(left: Block, right: Block) -> bool:
+    lt = (left.text or "").strip()
+    rt = (right.text or "").strip()
+    if not lt or not rt:
+        return False
+    if left.kind != right.kind:
+        return False
+    if left.kind == "cell_p" and not _same_table_cell(left, right):
+        return False
+    if _HEADING_RE.match(lt) or _HEADING_RE.match(rt):
+        return False
+    if _CLAIM_NUMBER_LINE_RE.match(lt) or _CLAIM_NUMBER_LINE_RE.match(rt):
+        return False
+    if _LIST_PREFIX_RE.match(rt):
+        return False
+    if _HARD_SENTENCE_END_RE.search(lt):
+        return False
+
+    # Conservative merge for wrapped lines: keep merges short.
+    return len(lt) <= 160 and len(rt) <= 160
+
+
+def build_translation_units(
+    blocks: List[Block],
+    *,
+    layout_mode: LayoutMode = "strict",
+) -> tuple[List[TranslationUnit], Dict[str, List[str]]]:
+    if layout_mode == "strict":
+        units = [TranslationUnit(id=b.id, kind=b.kind, text=b.text) for b in blocks]
+        return units, {b.id: [b.id] for b in blocks}
+
+    units: List[TranslationUnit] = []
+    mapping: Dict[str, List[str]] = {}
+    i = 0
+    n = len(blocks)
+    uidx = 0
+
+    while i < n:
+        first = blocks[i]
+        member_ids = [first.id]
+        member_texts = [first.text or ""]
+        j = i + 1
+
+        if j < n and _can_merge_blocks(first, blocks[j]):
+            member_ids.append(blocks[j].id)
+            member_texts.append(blocks[j].text or "")
+            j += 1
+
+        unit_id = f"u:{uidx}"
+        units.append(TranslationUnit(id=unit_id, kind=first.kind, text="\n".join(member_texts)))
+        mapping[unit_id] = member_ids
+
+        uidx += 1
+        i = j
+
+    return units, mapping
+
+
+def _balanced_split_text(text: str, n_parts: int) -> List[str]:
+    t = (text or "").strip()
+    if n_parts <= 1:
+        return [t]
+    if not t:
+        return [""] * n_parts
+
+    sents = [s.strip() for s in _SENTENCE_SPLIT_RE.split(t) if s.strip()]
+    if len(sents) >= n_parts:
+        out = ["" for _ in range(n_parts)]
+        for idx, s in enumerate(sents):
+            pos = min(idx * n_parts // len(sents), n_parts - 1)
+            out[pos] = (out[pos] + " " + s).strip()
+        return out
+
+    words = t.split()
+    if not words:
+        return [""] * n_parts
+    out = ["" for _ in range(n_parts)]
+    for idx, w in enumerate(words):
+        pos = min(idx * n_parts // len(words), n_parts - 1)
+        out[pos] = (out[pos] + " " + w).strip()
+    return out
+
+
+def expand_unit_translations(
+    unit_translations: Dict[str, str],
+    unit_to_block_ids: Dict[str, List[str]],
+    *,
+    layout_mode: LayoutMode,
+) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for uid, translated in unit_translations.items():
+        block_ids = unit_to_block_ids.get(uid, [])
+        if not block_ids:
+            continue
+
+        if len(block_ids) == 1 or layout_mode == "strict":
+            out[block_ids[0]] = translated
+            for bid in block_ids[1:]:
+                out[bid] = ""
+            continue
+
+        if layout_mode == "balanced":
+            parts = _balanced_split_text(translated, len(block_ids))
+            for bid, part in zip(block_ids, parts):
+                out[bid] = part
+            continue
+
+        # relaxed: place reconstructed sentence on first line, clear follower lines
+        out[block_ids[0]] = translated
+        for bid in block_ids[1:]:
+            out[bid] = ""
+    return out
+
+
+# ============================================================
+# 8) Apply translations back into DOCX
 # ============================================================
 
 def apply_translations_to_docx(
@@ -528,7 +672,7 @@ def apply_translations_to_docx(
 
 
 # ============================================================
-# 8) End-to-end runner
+# 9) End-to-end runner
 # ============================================================
 
 def translate_docx(
@@ -540,6 +684,7 @@ def translate_docx(
     max_chars_per_chunk: int = 2500,
     context_chars: int = 1000,
     chunk_overlap: int = 0,
+    layout_mode: LayoutMode = "relaxed",
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     prompt_default: str = "patent_kr2en_body_v1",
@@ -550,19 +695,23 @@ def translate_docx(
 ) -> None:
     print("Start chunking...")
     blocks = iter_blocks(src_docx_path)
+    units, unit_to_block_ids = build_translation_units(blocks, layout_mode=layout_mode)
     chunk_spans = chunk_blocks_with_spans(
-        blocks,
+        units,
         max_chars=max_chars_per_chunk,
         overlap=chunk_overlap,
     )
     chunks = [c for (c, _, _) in chunk_spans]
     contexts_raw = build_contexts(
-        blocks,
+        units,
         [(s, e) for (_, s, e) in chunk_spans],
         context_chars=context_chars,
     )
     contexts = [{"before": b, "after": a} for (b, a) in contexts_raw]
-    print(f"Finish chunking: {len(chunks)} chunks (context ±{context_chars} chars)")
+    print(
+        f"Finish chunking: {len(chunks)} chunks from {len(units)} units / {len(blocks)} blocks "
+        f"(context ±{context_chars} chars, layout_mode={layout_mode})"
+    )
 
     print("Build graph...")
     app = build_translation_graph()
@@ -602,5 +751,10 @@ def translate_docx(
         final = node_route_section({**final, "i": len(chunks)})
 
     print("Apply translations...")
-    apply_translations_to_docx(src_docx_path, final["results"], out_docx_path)
+    block_translations = expand_unit_translations(
+        final["results"],
+        unit_to_block_ids,
+        layout_mode=layout_mode,
+    )
+    apply_translations_to_docx(src_docx_path, block_translations, out_docx_path)
     print("Done.")

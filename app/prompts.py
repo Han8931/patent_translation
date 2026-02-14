@@ -73,6 +73,8 @@ COMMON_USER = (
     "SURROUNDING CONTEXT (for reference, do NOT translate these lines directly):\n"
     "BEFORE:\n${context_before}\n"
     "AFTER:\n${context_after}\n"
+    "- You MUST use BEFORE/AFTER to resolve sentence continuation, pronoun/reference targets, and term choice.\n"
+    "- If line breaks in INPUT look like formatting wraps, reconstruct natural patent English using context.\n"
     "\n"
     "OUTPUT REQUIREMENTS:\n"
     "- Return ONLY valid JSON (no markdown, no explanations).\n"
