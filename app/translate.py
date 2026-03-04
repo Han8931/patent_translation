@@ -434,6 +434,10 @@ def _chunk_text(chunk: List[Block]) -> str:
     return "\n".join((b.text or "") for b in chunk)
 
 
+def _has_abstract_heading(chunk: List[Block]) -> bool:
+    return bool(_ABSTRACT_HEADING_RE.search(_chunk_text(chunk)))
+
+
 def detect_section_from_chunk(prev: Section, chunk: List[Block]) -> Section:
     """
     Detect section headings with a few common variants:
@@ -484,7 +488,15 @@ def node_route_section(state: TranslateState) -> TranslateState:
         return state
 
     prev = state.get("section", "default")
-    new = detect_section_from_chunk(prev, state["chunks"][i])
+    curr_chunk = state["chunks"][i]
+    new = detect_section_from_chunk(prev, curr_chunk)
+
+    # Abstract should end at the abstract section boundary.
+    # If we are already in abstract mode but the current chunk does not include
+    # an abstract heading, route out so word-count suffix is attached near the
+    # actual abstract instead of trailing to the document end.
+    if prev == "abstract" and not _has_abstract_heading(curr_chunk):
+        new = "default"
 
     # once abstract is completed and we are past it, revert to default/spec handling
     if prev == "abstract" and state.get("abstract_completed"):
