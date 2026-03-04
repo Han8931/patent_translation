@@ -1,4 +1,8 @@
+# chunking.py
+
 from __future__ import annotations
+
+import re
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -193,3 +197,67 @@ def chunk_blocks_with_spans(
         start = next_start
 
     return chunks
+
+
+# --- Claim-aware chunking (NEW) ---
+
+_CLAIM_ITEM_HEADING_RE = re.compile(
+    r"(【\s*청구항\s*\d+\s*】)|(^\s*청구항\s*\d+\b)|(^\s*\d+\s*[.)])",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _is_claim_item_start(text: str) -> bool:
+    return bool(_CLAIM_ITEM_HEADING_RE.search((text or "").strip()))
+
+
+def chunk_blocks_patent_with_spans(
+    blocks: List[Block] | List[Block],
+    *,
+    max_chars: int = 2500,
+    overlap: int = 0,
+    claim_overlap: int = 0,
+) -> List[tuple[List[Block], int, int]]:
+    """
+    Chunk blocks while respecting claim boundaries.
+
+    - Outside claims: use normal size-based chunking with `overlap`.
+    - Inside claims: group by claim item start (청구항 N / 【청구항 N】 / "19." etc.)
+      and make ONE chunk per claim item (unless it exceeds max_chars).
+      Uses `claim_overlap` (default 0) inside a large claim if it must split.
+    """
+    if not isinstance(blocks, list):
+        blocks = list(blocks)
+
+    n = len(blocks)
+    out: List[tuple[List[Block], int, int]] = []
+
+    i = 0
+    while i < n:
+        # Find next claim-item start from i
+        if _is_claim_item_start(blocks[i].text or ""):
+            # Claim unit: [i, j) until next claim start or end
+            j = i + 1
+            while j < n and not _is_claim_item_start(blocks[j].text or ""):
+                j += 1
+
+            # Split within the claim if it exceeds max_chars (but never mix claims)
+            sub = blocks[i:j]
+            sub_chunks = chunk_blocks_with_spans(sub, max_chars=max_chars, overlap=claim_overlap)
+            for chunk, s, e in sub_chunks:
+                out.append((chunk, i + s, i + e))
+            i = j
+            continue
+
+        # Non-claim region: chunk until the next claim start
+        j = i
+        while j < n and not _is_claim_item_start(blocks[j].text or ""):
+            j += 1
+
+        sub = blocks[i:j]
+        sub_chunks = chunk_blocks_with_spans(sub, max_chars=max_chars, overlap=overlap)
+        for chunk, s, e in sub_chunks:
+            out.append((chunk, i + s, i + e))
+        i = j
+
+    return out

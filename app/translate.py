@@ -4,40 +4,35 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, List, Dict, Literal, Optional
+from typing import TypedDict, List, Dict, Literal, Optional, Tuple
+from json import JSONDecodeError
 
 from docx import Document
 from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
-from app.chunking import (
+from app.batch_tools.chunking import (
     Block,
     BlockType,
     iter_blocks,
     chunk_blocks_with_spans,
+    chunk_blocks_patent_with_spans,
     build_contexts,
 )
-from app.prompts import PROMPTS
+from app.batch_tools.prompts import PROMPTS
+from app.batch_tools.post_process import _format_claim_linebreaks
 
 # ============================================================
 # 0) Types
 # ============================================================
 
-Section = Literal["default", "claims", "claims_independent", "claims_dependent", "abstract"]
-LayoutMode = Literal["strict", "relaxed", "balanced"]
-
-
-@dataclass(frozen=True)
-class TranslationUnit:
-    id: str
-    kind: BlockType
-    text: str
+# NEW: add explicit "spec" (specification/description)
+Section = Literal["default", "spec", "claims", "abstract"]
 
 
 class TranslateState(TypedDict):
-    chunks: List[List[TranslationUnit]]
+    chunks: List[List[Block]]
     contexts: List[Dict[str, str]]
     i: int
     results: Dict[str, str]
@@ -51,39 +46,105 @@ class TranslateState(TypedDict):
     # routing / prompts
     section: Section
     prompt_default: str
-    prompt_claims: str  # legacy/fallback
-    prompt_claims_independent: str
-    prompt_claims_dependent: str
+    prompt_claims: str
+    prompt_claims_indep: str
+    prompt_claims_dep: str
     prompt_abstract: str
 
     # abstract word-count tracking
     abstract_word_count: int
     last_abstract_block_id: str | None
-    abstract_completed: bool  # marks that we've seen abstract body text
-    abstract_block_ids: List[str]
-    abstract_target_words: int
-    abstract_word_tolerance: int
-    abstract_rewritten: bool
+    abstract_completed: bool
 
     # cross-chunk context for terminology consistency
-    glossary: Dict[str, str]       # Korean term → English term (accumulated)
-    prev_translated_text: str      # English output of the previous chunk
+    glossary: Dict[str, str]  # Korean term → English term (accumulated)
+    prev_translated_text: str  # English output of the previous chunk
 
     # cross-chunk context for claim preambles
     claim_preambles: Dict[str, str]  # claim number → category (e.g. "1" → "method")
+
+
+def node_postprocess_claims(state: TranslateState) -> TranslateState:
+    """
+    Post-process the most recently translated claims chunk:
+    - enforce newline after ':' and ';'
+    - (optional) indent lines after the first line
+    """
+    # Only run for claims
+    if state.get("section") != "claims":
+        return state
+
+    i = int(state.get("i", 0))
+    prev_i = i - 1
+    chunks = state.get("chunks", [])
+    if prev_i < 0 or prev_i >= len(chunks):
+        return state
+
+    chunk = chunks[prev_i]
+    results = state.get("results", {})
+    if not chunk or not results:
+        return state
+
+    new_results = dict(results)
+
+    # Apply formatting to any non-empty text in this chunk
+    for b in chunk:
+        bid = b.id
+        txt = (new_results.get(bid) or "")
+        if txt.strip():
+            new_results[bid] = _format_claim_linebreaks(txt, indent="    ")  # indent optional
+
+    return {**state, "results": new_results}
 
 
 # ============================================================
 # 1) OpenAI client + JSON extraction fallback
 # ============================================================
 
+
 def make_client(base_url: Optional[str] = None, api_key: Optional[str] = None) -> OpenAI:
-    kwargs = {"timeout": 120.0, "max_retries": 2}
+    kwargs = {"timeout": 2400, "max_retries": 2}
     if base_url:
         kwargs["base_url"] = base_url
     if api_key:
         kwargs["api_key"] = api_key
     return OpenAI(**kwargs)
+
+
+def repair_json_with_llm(client: OpenAI, model: str, bad_output: str) -> str:
+    """
+    Ask the model to convert malformed JSON-ish output into valid JSON.
+    Keeps content as-is as much as possible; only fixes JSON syntax.
+    """
+    sys = (
+        "You are a strict JSON repair tool.\n"
+        "Convert the user's content into VALID JSON that matches the required schema.\n"
+        "Rules:\n"
+        "- Output ONLY JSON. No markdown. No commentary.\n"
+        "- Use DOUBLE QUOTES for all keys/strings.\n"
+        "- Do NOT add or remove translation items unless necessary to make JSON valid.\n"
+        "- Preserve ids and translated text as-is whenever possible.\n"
+        "- If there are unescaped quotes inside text fields, escape them.\n"
+        "- Return a single JSON object.\n"
+    )
+    user = (
+        "Fix the following into valid JSON.\n"
+        'Required top-level keys: "translations" (list of {"id","text"})\n'
+        'Optional keys: "key_terms", "claim_preambles"\n'
+        "\n"
+        "CONTENT TO REPAIR:\n"
+        f"{bad_output}\n"
+    )
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.0,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
 def extract_first_json_object(s: str) -> Optional[str]:
@@ -108,8 +169,74 @@ def extract_first_json_object(s: str) -> Optional[str]:
 
 
 # ============================================================
+# 1.5) Claims post-processing helpers (NEW)
+# ============================================================
+
+# Detect claim number from Korean headers like 【청구항 19】 / 청구항 19
+_CLAIM_NUM_FROM_BRACKET = re.compile(r"【\s*청구항\s*(\d+)\s*】")
+_CLAIM_NUM_FROM_KR = re.compile(r"\b청구항\s*(\d+)\b")
+# English numeric prefix: "19. "
+_CLAIM_EN_PREFIX = re.compile(r"^\s*(\d+)\.\s+")
+# English "CLAIM 19" / "Claim 19"
+_CLAIM_EN_WORDING = re.compile(r"^\s*CLAIM\s+(\d+)\b[:\s\-]*", re.IGNORECASE)
+
+
+def _extract_claim_number_from_chunk(chunk: List[Block]) -> Optional[str]:
+    for b in chunk:
+        t = (b.text or "").strip()
+        m = _CLAIM_NUM_FROM_BRACKET.search(t)
+        if m:
+            return m.group(1)
+        m = _CLAIM_NUM_FROM_KR.search(t)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _ensure_claim_number_prefix(text: str, claim_num: str) -> str:
+    s = (text or "").lstrip()
+    if not claim_num:
+        return text or ""
+
+    # Already "N. ..."
+    if _CLAIM_EN_PREFIX.match(s):
+        return s
+
+    # Strip "CLAIM N" / "Claim N" prefixes if present
+    s = re.sub(r"^\s*CLAIM\s+%s\b[:\s\-]*" % re.escape(claim_num), "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\s*Claim\s+%s\b[:\s\-]*" % re.escape(claim_num), "", s, flags=re.IGNORECASE)
+
+    return f"{claim_num}. {s}".strip()
+
+
+def _move_first_nonempty_to_first_id(translated_map: Dict[str, str], chunk: List[Block]) -> Dict[str, str]:
+    """
+    If the model violated the merge rule and put the merged claim text into a later item,
+    move the first non-empty string to the first block id and blank out the source.
+    """
+    if not chunk:
+        return translated_map
+
+    first_id = chunk[0].id
+    first_txt = (translated_map.get(first_id) or "").strip()
+    if first_txt:
+        return translated_map
+
+    # Find first non-empty among the chunk ids
+    for b in chunk[1:]:
+        txt = (translated_map.get(b.id) or "").strip()
+        if txt:
+            new_map = dict(translated_map)
+            new_map[first_id] = txt
+            new_map[b.id] = ""
+            return new_map
+    return translated_map
+
+
+# ============================================================
 # 2) Translate one chunk with a given prompt
 # ============================================================
+
 
 def _format_glossary(glossary: Dict[str, str]) -> str:
     if not glossary:
@@ -125,7 +252,7 @@ def _format_claim_preambles(preambles: Dict[str, str]) -> str:
         f"Claim {num}: {cat}"
         for num, cat in sorted(
             preambles.items(),
-            key=lambda x: int(x[0]) if x[0].isdigit() else 0
+            key=lambda x: int(x[0]) if x[0].isdigit() else 0,
         )
     ]
     return "\n".join(lines)
@@ -134,10 +261,28 @@ def _format_claim_preambles(preambles: Dict[str, str]) -> str:
 _INDEP_CLAIM_RE = re.compile(r"^\s*(\d+)\.\s+An?\s+(\w+)", re.MULTILINE)
 
 _CATEGORY_WORDS = {
-    "method", "apparatus", "system", "device", "medium", "program",
-    "composition", "compound", "kit", "assembly", "machine", "article",
-    "process", "circuit", "network", "computer", "storage", "structure",
-    "sensor", "module", "unit", "arrangement",
+    "method",
+    "apparatus",
+    "system",
+    "device",
+    "medium",
+    "program",
+    "composition",
+    "compound",
+    "kit",
+    "assembly",
+    "machine",
+    "article",
+    "process",
+    "circuit",
+    "network",
+    "computer",
+    "storage",
+    "structure",
+    "sensor",
+    "module",
+    "unit",
+    "arrangement",
 }
 
 
@@ -158,13 +303,12 @@ def translate_chunk(
     *,
     prompt_name: str,
     target_lang: str,
-    chunk: List[TranslationUnit],
+    chunk: List[Block],
     context_before: str = "",
     context_after: str = "",
     glossary: Dict[str, str] | None = None,
     prev_translated_text: str = "",
     claim_preambles: Dict[str, str] | None = None,
-    abstract_target_words: int = 0,
 ) -> tuple[Dict[str, str], List[Dict[str, str]], Dict[str, str]]:
     """Translate a chunk and return (translations, key_terms, new_claim_preambles)."""
     prompt = PROMPTS[prompt_name]
@@ -184,12 +328,6 @@ def translate_chunk(
         prev_translation=prev_translation,
         claim_preambles=preambles_str,
     )
-    if abstract_target_words > 0 and "abstract" in prompt_name:
-        user_prompt += (
-            "\nADDITIONAL ABSTRACT CONSTRAINT:\n"
-            f"- Target exactly {abstract_target_words} English words for the abstract body text.\n"
-            "- Do not include headings in the count.\n"
-        )
 
     resp = client.chat.completions.create(
         model=model,
@@ -202,13 +340,25 @@ def translate_chunk(
 
     content = (resp.choices[0].message.content or "").strip()
 
+    # 1) Try direct JSON
     try:
         data = json.loads(content)
-    except Exception:
+    except JSONDecodeError:
+        # 2) Try extracting the first {...}
         json_str = extract_first_json_object(content)
-        if not json_str:
-            raise ValueError(f"Model did not return JSON. Got:\n{content[:800]}")
-        data = json.loads(json_str)
+        if json_str:
+            try:
+                data = json.loads(json_str)
+            except JSONDecodeError:
+                # 3) Ask model to repair JSON
+                repaired = repair_json_with_llm(client, model, content)
+                repaired_json = extract_first_json_object(repaired) or repaired
+                data = json.loads(repaired_json)
+        else:
+            # 3) Ask model to repair JSON (even if no braces found)
+            repaired = repair_json_with_llm(client, model, content)
+            repaired_json = extract_first_json_object(repaired) or repaired
+            data = json.loads(repaired_json)
 
     out: Dict[str, str] = {}
     translations = data.get("translations", [])
@@ -247,8 +397,10 @@ def translate_chunk(
 
 _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 
+
 def count_english_words(text: str) -> int:
     return len(_WORD_RE.findall(text or ""))
+
 
 def append_word_count_to_last_sentence(text: str, n: int) -> str:
     s = (text or "").rstrip()
@@ -259,88 +411,58 @@ def append_word_count_to_last_sentence(text: str, n: int) -> str:
     return f"{s} ({n} words)"
 
 
-def _strip_abstract_heading(text: str) -> str:
-    return re.sub(r"^ABSTRACT[:\s\-]*", "", (text or "").strip(), flags=re.IGNORECASE).strip()
-
-
-def _call_abstract_rewrite(
-    *,
-    client: OpenAI,
-    model: str,
-    abstract_text: str,
-    target_words: int,
-) -> str:
-    system_prompt = (
-        "You are a patent abstract editor. Rewrite for legal-faithful clarity.\n"
-        "Return only the rewritten abstract text without markdown, labels, or explanations."
-    )
-    user_prompt = (
-        f"Rewrite the following abstract to be exactly {target_words} English words.\n"
-        "Keep technical meaning and scope unchanged.\n"
-        "Do not add numbering, headings, or commentary.\n\n"
-        f"ABSTRACT:\n{abstract_text}"
-    )
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.0,
-    )
-    out = (resp.choices[0].message.content or "").strip()
-    out = re.sub(r"^```(?:text)?\s*", "", out, flags=re.IGNORECASE).strip()
-    out = re.sub(r"\s*```$", "", out).strip()
-    return _strip_abstract_heading(out)
-
-
 # ============================================================
 # 4) Section detection + routing
 # ============================================================
 
-def _chunk_text(chunk: List[TranslationUnit]) -> str:
-    return "\n".join((b.text or "") for b in chunk)
-
-def detect_section_from_chunk(prev: Section, chunk: List[TranslationUnit]) -> Section:
-    """
-    Claims starts with 【청구 범위】 (sometimes without space).
-    Abstract starts with 【요약】, but many KR docs also have 【요약서】.
-    Sticky behavior: if no heading is found, keep previous section.
-    """
-    t = _chunk_text(chunk)
-
-    # If we're already in abstract, keep it sticky (caller decides exit timing)
-    if prev == "abstract":
-        return "abstract"
-
-    # Claims
-    if "【청구" in t:
-        return "claims"
-
-    # Abstract: match 【요약】 and 【요약서】 and similar forms
-    if "【요약" in t:
-        return "abstract"
-
-    return prev
-
-
-_DEP_CLAIM_RE = re.compile(r"(청구항\s*\d+|제\s*\d+\s*항)\s*(에\s*따른|에\s*따라|에\s*있어서|의)")
-# Abstract-ending / non-abstract markers (대표도 + FIG lines)
-_FIGURE_RE = re.compile(
-    r"(【\s*대표도\s*】|대표도|도\s*\d+[A-Za-z]?|FIG\.\s*\d+|도면의\s*간단한\s*설명)"
+_ABSTRACT_HEADING_RE = re.compile(r"【?\s*요\s*약\s*】?|요약서|초록|ABSTRACT", re.IGNORECASE)
+_CLAIMS_HEADING_RE = re.compile(
+    r"(^\s*【?\s*청구\s*범위\s*】?\s*$)|"
+    r"(^\s*【?\s*청구항\s*\d+\s*(?:】|[.)])?\s*$)|"
+    r"(^\s*CLAIMS?\s*$)",
+    re.IGNORECASE | re.MULTILINE,
 )
 
-def is_dependent_claim_chunk(chunk: List[TranslationUnit]) -> bool:
-    t = _chunk_text(chunk)
-    return bool(_DEP_CLAIM_RE.search(t))
+# NEW: spec/description detection
+_SPEC_HEADING_RE = re.compile(
+    r"(발명의\s*상세한\s*설명|상세한\s*설명|명세서|DESCRIPTION|DETAILED\s+DESCRIPTION)",
+    re.IGNORECASE,
+)
 
-def is_figure_description_chunk(chunk: List[TranslationUnit]) -> bool:
+
+def _chunk_text(chunk: List[Block]) -> str:
+    return "\n".join((b.text or "") for b in chunk)
+
+
+def detect_section_from_chunk(prev: Section, chunk: List[Block]) -> Section:
     """
-    Heuristic: 대표도 / 도 1 / FIG. 1 / brief description of drawings often follow the abstract.
-    If detected, we should exit the abstract section to avoid counting their words.
+    Detect section headings with a few common variants:
+    - Claims: 【청구 범위】, 【청구범위】, 청구항, Claims/CLAIMS
+    - Abstract: 【요약】 plus loose spacing, 요약서, 초록, ABSTRACT
+    - Spec: 발명의 상세한 설명, 상세한 설명, 명세서, DESCRIPTION, DETAILED DESCRIPTION
+
+    Sticky behavior: if no heading is found, keep previous section.
+    If multiple headings appear in same chunk, choose the earliest one.
     """
     t = _chunk_text(chunk)
-    return bool(_FIGURE_RE.search(t))
+
+    m_abs = _ABSTRACT_HEADING_RE.search(t)
+    m_claim = _CLAIMS_HEADING_RE.search(t)
+    m_spec = _SPEC_HEADING_RE.search(t)
+
+    candidates: List[Tuple[Section, int]] = []
+    if m_abs:
+        candidates.append(("abstract", m_abs.start()))
+    if m_claim:
+        candidates.append(("claims", m_claim.start()))
+    if m_spec:
+        candidates.append(("spec", m_spec.start()))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[1])
+        return candidates[0][0]
+
+    return prev
 
 
 def node_route_section(state: TranslateState) -> TranslateState:
@@ -350,60 +472,12 @@ def node_route_section(state: TranslateState) -> TranslateState:
         n = int(s.get("abstract_word_count", 0) or 0)
         last_id = s.get("last_abstract_block_id")
         results = s.get("results", {})
-        abstract_ids = list(s.get("abstract_block_ids", []))
-        target = int(s.get("abstract_target_words", 0) or 0)
-        tol = int(s.get("abstract_word_tolerance", 0) or 0)
-        rewritten = bool(s.get("abstract_rewritten", False))
-
-        new_results = dict(results)
-
-        # Enforce target words with a rewrite pass when configured.
-        if (
-            target > 0
-            and not rewritten
-            and abstract_ids
-            and abs(n - target) > tol
-        ):
-            combined = "\n".join(
-                _strip_abstract_heading(new_results.get(bid, ""))
-                for bid in abstract_ids
-                if (new_results.get(bid, "") or "").strip()
-            ).strip()
-            if combined:
-                try:
-                    client = make_client(s.get("base_url"), s.get("api_key"))
-                    rewritten_text = _call_abstract_rewrite(
-                        client=client,
-                        model=s["model"],
-                        abstract_text=combined,
-                        target_words=target,
-                    )
-                    if rewritten_text:
-                        # Keep abstract as a single coherent paragraph on the last abstract id.
-                        for bid in abstract_ids:
-                            if bid != last_id:
-                                new_results[bid] = ""
-                        if last_id:
-                            new_results[last_id] = rewritten_text
-                        n = count_english_words(rewritten_text)
-                        rewritten = True
-                        print(f"[ABSTRACT] rewrite applied: {n} words (target={target}, tol={tol})")
-                except Exception as e:
-                    print(f"[ABSTRACT] rewrite skipped due to error: {e}")
-
-        if n > 0 and last_id and last_id in new_results:
+        if n > 0 and last_id and last_id in results:
+            new_results = dict(results)
             new_results[last_id] = append_word_count_to_last_sentence(new_results[last_id], n)
-            return {
-                **s,
-                "results": new_results,
-                "abstract_completed": True,
-                "abstract_word_count": n,
-                "abstract_rewritten": rewritten,
-            }
+            return {**s, "results": new_results, "abstract_completed": True}
+        return s
 
-        return {**s, "results": new_results, "abstract_rewritten": rewritten}
-
-    # If we are done, finalize abstract once here
     if i >= len(state["chunks"]):
         if state.get("section") == "abstract" or state.get("abstract_word_count", 0):
             return finalize_abstract_word_count(state)
@@ -412,11 +486,10 @@ def node_route_section(state: TranslateState) -> TranslateState:
     prev = state.get("section", "default")
     new = detect_section_from_chunk(prev, state["chunks"][i])
 
-    # If we're in abstract and see representative-figure / drawing markers, exit abstract
-    if prev == "abstract" and is_figure_description_chunk(state["chunks"][i]):
+    # once abstract is completed and we are past it, revert to default/spec handling
+    if prev == "abstract" and state.get("abstract_completed"):
         new = "default"
 
-    # Leaving abstract -> finalize "(XXX words)" on last abstract sentence
     if prev == "abstract" and new != "abstract":
         finalized = finalize_abstract_word_count(state)
         if finalized is not state:
@@ -435,22 +508,131 @@ def route_after_router(state: TranslateState) -> str:
 
     sec = state.get("section", "default")
     if sec == "claims":
-        chunk = state["chunks"][state["i"]]
-        if is_dependent_claim_chunk(chunk):
-            return "translate_claims_dependent"
-        return "translate_claims_independent"
-    if sec == "claims_independent":
-        return "translate_claims_independent"
-    if sec == "claims_dependent":
-        return "translate_claims_dependent"
+        return "classify_claims"
     if sec == "abstract":
         return "translate_abstract"
+    # spec/default -> translate_default (spec uses prompt_default)
     return "translate_default"
+
+
+# ============================================================
+# 4.5) NEW: Section-sized chunking + adaptive fallback
+# ============================================================
+
+
+def chunk_blocks_by_section_with_spans(blocks: List[Block]) -> List[tuple[List[Block], int, int]]:
+    """
+    Returns [(chunk_blocks, start_idx, end_idx_exclusive), ...]
+    where each chunk is an entire contiguous section (abstract/claims/spec/default).
+    """
+    spans: List[tuple[List[Block], int, int]] = []
+    if not blocks:
+        return spans
+
+    curr_sec: Section = detect_section_from_chunk("default", [blocks[0]])
+    start = 0
+
+    for i in range(1, len(blocks)):
+        sec_i = detect_section_from_chunk(curr_sec, [blocks[i]])
+        if sec_i != curr_sec:
+            spans.append((blocks[start:i], start, i))
+            start = i
+            curr_sec = sec_i
+
+    spans.append((blocks[start:len(blocks)], start, len(blocks)))
+    return spans
+
+
+def total_chars(chunk: List[Block]) -> int:
+    return sum(len(b.text or "") for b in chunk)
+
+
+def build_section_chunks_with_fallback(
+    blocks_list: List[Block],
+    *,
+    max_section_chars: int,
+    max_chars_per_chunk: int,
+    chunk_overlap: int,
+) -> List[tuple[List[Block], int, int]]:
+    """
+    1) Try section-sized chunks (whole Abstract / whole Claims / whole Spec).
+    2) If any section chunk is too large, fallback to patent-aware chunking
+       within that section, preserving global indices.
+    """
+    section_spans = chunk_blocks_by_section_with_spans(blocks_list)
+
+    final_spans: List[tuple[List[Block], int, int]] = []
+    for chunk, s, e in section_spans:
+        if total_chars(chunk) <= max_section_chars:
+            final_spans.append((chunk, s, e))
+            continue
+
+        # fallback: split only inside this oversized section
+        print(f"[CHUNK] section too large ({total_chars(chunk)} chars). Fallback split: blocks[{s}:{e}]")
+        sub_spans = chunk_blocks_patent_with_spans(
+            blocks_list[s:e],
+            max_chars=max_chars_per_chunk,
+            overlap=chunk_overlap,
+            claim_overlap=0,  # recommended: don't overlap across claim sub-splits
+        )
+        for sub_chunk, sub_s, sub_e in sub_spans:
+            final_spans.append((sub_chunk, s + sub_s, s + sub_e))
+
+    return final_spans
 
 
 # ============================================================
 # 5) Translation nodes (default/claims/abstract)
 # ============================================================
+
+
+def _normalize_translations_for_chunk(
+    *,
+    chunk: List[Block],
+    translated_map: Dict[str, str],
+    section: Section,
+) -> tuple[Dict[str, str], List[str], List[str]]:
+    """
+    Ensure exactly one output entry per input block id.
+    - Drops unexpected ids from model output.
+    - Fills missing ids deterministically.
+    """
+    expected_ids = [b.id for b in chunk]
+    expected_set = set(expected_ids)
+    source_by_id = {b.id: (b.text or "") for b in chunk}
+
+    unexpected = [k for k in translated_map.keys() if k not in expected_set]
+    missing = [bid for bid in expected_ids if bid not in translated_map]
+
+    normalized: Dict[str, str] = {}
+    for bid in expected_ids:
+        if bid in translated_map:
+            normalized[bid] = translated_map[bid]
+            continue
+
+        # Claims mode intentionally allows empty non-first items due merge rules.
+        if section == "claims" and bid != expected_ids[0]:
+            normalized[bid] = ""
+        else:
+            # Prefer preserving source text over silent drops.
+            normalized[bid] = source_by_id[bid]
+
+    # Claims guard: first item should never be blank when possible.
+    if section == "claims" and expected_ids:
+        first_id = expected_ids[0]
+        if not (normalized.get(first_id) or "").strip():
+            for bid in expected_ids[1:]:
+                txt = normalized.get(bid, "")
+                if txt.strip():
+                    normalized[first_id] = txt
+                    normalized[bid] = ""
+                    break
+
+            if not (normalized.get(first_id) or "").strip():
+                normalized[first_id] = source_by_id[first_id]
+
+    return normalized, missing, unexpected
+
 
 def _translate_with_prompt(state: TranslateState, prompt_name: str) -> TranslateState:
     i = state["i"]
@@ -464,10 +646,10 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     ctx_before = contexts[i].get("before", "") if i < len(contexts) else ""
     ctx_after = contexts[i].get("after", "") if i < len(contexts) else ""
     sec = state.get("section", "default")
+
     glossary = dict(state.get("glossary", {}))
     prev_translated_text = state.get("prev_translated_text", "")
     claim_preambles = dict(state.get("claim_preambles", {}))
-    abstract_target_words = int(state.get("abstract_target_words", 0) or 0)
 
     print(f"[{sec}] {i}-th chunk... (glossary: {len(glossary)} terms, preambles: {len(claim_preambles)})")
 
@@ -482,8 +664,29 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         glossary=glossary,
         prev_translated_text=prev_translated_text,
         claim_preambles=claim_preambles,
-        abstract_target_words=abstract_target_words,
     )
+
+    # -------------------------
+    # Claims: enforce merge + numbering (NEW)
+    # -------------------------
+    if sec == "claims":
+        translated_map = _move_first_nonempty_to_first_id(translated_map, chunk)
+
+        claim_num = _extract_claim_number_from_chunk(chunk)
+        if claim_num and chunk:
+            first_id = chunk[0].id
+            translated_map[first_id] = _ensure_claim_number_prefix(translated_map.get(first_id, ""), claim_num)
+
+    translated_map, missing_ids, unexpected_ids = _normalize_translations_for_chunk(
+        chunk=chunk,
+        translated_map=translated_map,
+        section=sec,
+    )
+    if missing_ids or unexpected_ids:
+        print(
+            f"[WARN] chunk {i}: normalized translation ids "
+            f"(missing={len(missing_ids)}, unexpected={len(unexpected_ids)})"
+        )
 
     results = dict(state["results"])
     results.update(translated_map)
@@ -502,34 +705,17 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     abstract_word_count = int(state.get("abstract_word_count", 0))
     last_abstract_block_id = state.get("last_abstract_block_id")
     abstract_completed = state.get("abstract_completed", False)
-    abstract_block_ids = list(state.get("abstract_block_ids", []))
 
     if sec == "abstract":
-        for b in chunk:
-            bid = b.id
-            txt = translated_map.get(bid, "")
+        for bid, txt in translated_map.items():
             t = (txt or "").strip()
-
-            # Remove ABSTRACT heading if model attaches it
-            t_no_heading = re.sub(r"^ABSTRACT[:\s\-]*", "", t, flags=re.IGNORECASE).strip()
-
-            # Skip pure heading lines
-            if not t_no_heading or t_no_heading.upper() == "ABSTRACT":
+            t_no_heading = re.sub(r"^ABSTRACT[:\s\-]*", "", t, flags=re.IGNORECASE)
+            if t_no_heading.upper() == "ABSTRACT":
                 continue
-
-            # Skip 대표도/FIG captions from word count (common end-of-doc pattern)
-            if re.match(r"^(REPRESENTATIVE\s+FIGURE)\b", t_no_heading, flags=re.IGNORECASE):
-                continue
-            if re.match(r"^(FIG\.)\s*\d+", t_no_heading, flags=re.IGNORECASE):
-                continue
-
             wc = count_english_words(t_no_heading)
             if wc > 0:
                 abstract_word_count += wc
                 last_abstract_block_id = bid
-                if bid not in abstract_block_ids:
-                    abstract_block_ids.append(bid)
-
         if abstract_word_count > 0:
             abstract_completed = True
 
@@ -540,7 +726,6 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         "abstract_word_count": abstract_word_count,
         "last_abstract_block_id": last_abstract_block_id,
         "abstract_completed": abstract_completed,
-        "abstract_block_ids": abstract_block_ids,
         "glossary": glossary,
         "prev_translated_text": new_prev,
         "claim_preambles": claim_preambles,
@@ -550,31 +735,67 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
 def node_translate_default(state: TranslateState) -> TranslateState:
     return _translate_with_prompt(state, state["prompt_default"])
 
+
 def node_translate_claims(state: TranslateState) -> TranslateState:
     return _translate_with_prompt(state, state["prompt_claims"])
 
-def node_translate_claims_independent(state: TranslateState) -> TranslateState:
-    return _translate_with_prompt(state, state["prompt_claims_independent"])
 
-def node_translate_claims_dependent(state: TranslateState) -> TranslateState:
-    return _translate_with_prompt(state, state["prompt_claims_dependent"])
+# --- CLAIM CLASSIFICATION ROUTING (FIXED) ---
+
+
+def node_classify_claims(state: TranslateState) -> TranslateState:
+    return state
+
+
+def route_after_claim_classify(state: TranslateState) -> str:
+    i = state.get("i", 0)
+    if i >= len(state.get("chunks", [])):
+        return "translate_claims_indep"
+
+    chunk = state["chunks"][i]
+    text = "\n".join((b.text or "") for b in chunk)
+
+    if re.search(r"제\s*\d+\s*항", text) or re.search(r"claim\s+\d+", text, re.IGNORECASE):
+        return "translate_claims_dep"
+    return "translate_claims_indep"
+
+
+def node_translate_claims_indep(state: TranslateState) -> TranslateState:
+    return _translate_with_prompt(
+        state,
+        state.get("prompt_claims_indep", "patent_kr2en_claims_indep_v1"),
+    )
+
+
+def node_translate_claims_dep(state: TranslateState) -> TranslateState:
+    return _translate_with_prompt(
+        state,
+        state.get("prompt_claims_dep", "patent_kr2en_claims_dep_v1"),
+    )
+
 
 def node_translate_abstract(state: TranslateState) -> TranslateState:
     return _translate_with_prompt(state, state["prompt_abstract"])
 
 
 # ============================================================
-# 6) Build graph
+# 6) Build graph (router -> specialized translate -> router ...)
 # ============================================================
+
 
 def build_translation_graph():
     g = StateGraph(TranslateState)
 
     g.add_node("route_section", node_route_section)
     g.add_node("translate_default", node_translate_default)
-    g.add_node("translate_claims", node_translate_claims)
-    g.add_node("translate_claims_independent", node_translate_claims_independent)
-    g.add_node("translate_claims_dependent", node_translate_claims_dependent)
+
+    g.add_node("postprocess_claims", node_postprocess_claims)
+
+    g.add_node("classify_claims", node_classify_claims)
+
+    g.add_node("translate_claims", node_translate_claims)  # legacy fallback
+    g.add_node("translate_claims_indep", node_translate_claims_indep)
+    g.add_node("translate_claims_dep", node_translate_claims_dep)
     g.add_node("translate_abstract", node_translate_abstract)
 
     g.set_entry_point("route_section")
@@ -584,160 +805,33 @@ def build_translation_graph():
         route_after_router,
         {
             "translate_default": "translate_default",
-            "translate_claims": "translate_claims",
-            "translate_claims_independent": "translate_claims_independent",
-            "translate_claims_dependent": "translate_claims_dependent",
+            "classify_claims": "classify_claims",
             "translate_abstract": "translate_abstract",
             END: END,
         },
     )
 
+    g.add_conditional_edges(
+        "classify_claims",
+        route_after_claim_classify,
+        {
+            "translate_claims_indep": "translate_claims_indep",
+            "translate_claims_dep": "translate_claims_dep",
+        },
+    )
+
     g.add_edge("translate_default", "route_section")
-    g.add_edge("translate_claims", "route_section")
-    g.add_edge("translate_claims_independent", "route_section")
-    g.add_edge("translate_claims_dependent", "route_section")
+    g.add_edge("translate_claims", "postprocess_claims")
+    g.add_edge("translate_claims_indep", "postprocess_claims")
+    g.add_edge("translate_claims_dep", "postprocess_claims")
+    g.add_edge("postprocess_claims", "route_section")
     g.add_edge("translate_abstract", "route_section")
 
     return g.compile()
 
 
 # ============================================================
-# 7) Translation units + writeback mapping
-# ============================================================
-
-_HEADING_RE = re.compile(r"^\s*【[^】]+】\s*$")
-_CLAIM_NUMBER_LINE_RE = re.compile(r"^\s*\d+\s*[\.\)]")
-_LIST_PREFIX_RE = re.compile(r"^\s*[-*•]\s+")
-_HARD_SENTENCE_END_RE = re.compile(r"[.!?;:]\s*$")
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;:])\s+")
-
-
-def _same_table_cell(a: Block, b: Block) -> bool:
-    if not (a.id.startswith("cell:") and b.id.startswith("cell:")):
-        return False
-    a_parts = a.id.split(":")
-    b_parts = b.id.split(":")
-    if len(a_parts) != 5 or len(b_parts) != 5:
-        return False
-    return a_parts[:4] == b_parts[:4]
-
-
-def _can_merge_blocks(left: Block, right: Block) -> bool:
-    lt = (left.text or "").strip()
-    rt = (right.text or "").strip()
-    if not lt or not rt:
-        return False
-    if left.kind != right.kind:
-        return False
-    if left.kind == "cell_p" and not _same_table_cell(left, right):
-        return False
-    if _HEADING_RE.match(lt) or _HEADING_RE.match(rt):
-        return False
-    if _CLAIM_NUMBER_LINE_RE.match(lt) or _CLAIM_NUMBER_LINE_RE.match(rt):
-        return False
-    if _LIST_PREFIX_RE.match(rt):
-        return False
-    if _HARD_SENTENCE_END_RE.search(lt):
-        return False
-
-    # Conservative merge for wrapped lines: keep merges short.
-    return len(lt) <= 160 and len(rt) <= 160
-
-
-def build_translation_units(
-    blocks: List[Block],
-    *,
-    layout_mode: LayoutMode = "strict",
-) -> tuple[List[TranslationUnit], Dict[str, List[str]]]:
-    if layout_mode == "strict":
-        units = [TranslationUnit(id=b.id, kind=b.kind, text=b.text) for b in blocks]
-        return units, {b.id: [b.id] for b in blocks}
-
-    units: List[TranslationUnit] = []
-    mapping: Dict[str, List[str]] = {}
-    i = 0
-    n = len(blocks)
-    uidx = 0
-
-    while i < n:
-        first = blocks[i]
-        member_ids = [first.id]
-        member_texts = [first.text or ""]
-        j = i + 1
-
-        if j < n and _can_merge_blocks(first, blocks[j]):
-            member_ids.append(blocks[j].id)
-            member_texts.append(blocks[j].text or "")
-            j += 1
-
-        unit_id = f"u:{uidx}"
-        units.append(TranslationUnit(id=unit_id, kind=first.kind, text="\n".join(member_texts)))
-        mapping[unit_id] = member_ids
-
-        uidx += 1
-        i = j
-
-    return units, mapping
-
-
-def _balanced_split_text(text: str, n_parts: int) -> List[str]:
-    t = (text or "").strip()
-    if n_parts <= 1:
-        return [t]
-    if not t:
-        return [""] * n_parts
-
-    sents = [s.strip() for s in _SENTENCE_SPLIT_RE.split(t) if s.strip()]
-    if len(sents) >= n_parts:
-        out = ["" for _ in range(n_parts)]
-        for idx, s in enumerate(sents):
-            pos = min(idx * n_parts // len(sents), n_parts - 1)
-            out[pos] = (out[pos] + " " + s).strip()
-        return out
-
-    words = t.split()
-    if not words:
-        return [""] * n_parts
-    out = ["" for _ in range(n_parts)]
-    for idx, w in enumerate(words):
-        pos = min(idx * n_parts // len(words), n_parts - 1)
-        out[pos] = (out[pos] + " " + w).strip()
-    return out
-
-
-def expand_unit_translations(
-    unit_translations: Dict[str, str],
-    unit_to_block_ids: Dict[str, List[str]],
-    *,
-    layout_mode: LayoutMode,
-) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for uid, translated in unit_translations.items():
-        block_ids = unit_to_block_ids.get(uid, [])
-        if not block_ids:
-            continue
-
-        if len(block_ids) == 1 or layout_mode == "strict":
-            out[block_ids[0]] = translated
-            for bid in block_ids[1:]:
-                out[bid] = ""
-            continue
-
-        if layout_mode == "balanced":
-            parts = _balanced_split_text(translated, len(block_ids))
-            for bid, part in zip(block_ids, parts):
-                out[bid] = part
-            continue
-
-        # relaxed: place reconstructed sentence on first line, clear follower lines
-        out[block_ids[0]] = translated
-        for bid in block_ids[1:]:
-            out[bid] = ""
-    return out
-
-
-# ============================================================
-# 8) Apply translations back into DOCX
+# 7) Apply translations back into DOCX
 # ============================================================
 
 def apply_translations_to_docx(
@@ -758,7 +852,10 @@ def apply_translations_to_docx(
             parts = block_id.split(":")
             if len(parts) == 5:
                 _, ti, ri, ci, pi = parts
-                ti = int(ti); ri = int(ri); ci = int(ci); pi = int(pi)
+                ti = int(ti)
+                ri = int(ri)
+                ci = int(ci)
+                pi = int(pi)
 
                 if 0 <= ti < len(doc.tables):
                     table = doc.tables[ti]
@@ -773,8 +870,9 @@ def apply_translations_to_docx(
 
 
 # ============================================================
-# 9) End-to-end runner
+# 8) End-to-end runner
 # ============================================================
+
 
 def translate_docx(
     src_docx_path: str | Path,
@@ -785,36 +883,37 @@ def translate_docx(
     max_chars_per_chunk: int = 2500,
     context_chars: int = 1000,
     chunk_overlap: int = 0,
-    layout_mode: LayoutMode = "relaxed",
-    abstract_target_words: int = 0,
-    abstract_word_tolerance: int = 5,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     prompt_default: str = "patent_kr2en_body_v1",
     prompt_claims: str = "patent_kr2en_claims_v1",
-    prompt_claims_independent: str = "patent_kr2en_claims_independent_v1",
-    prompt_claims_dependent: str = "patent_kr2en_claims_dependent_v1",
+    prompt_claims_indep: str = "patent_kr2en_claims_indep_v1",
+    prompt_claims_dep: str = "patent_kr2en_claims_dep_v1",
     prompt_abstract: str = "patent_kr2en_abstract_v1",
+    # NEW: "whole-section" mode with adaptive fallback
+    max_section_chars: int = 80_000,
 ) -> None:
     print("Start chunking...")
-    blocks = iter_blocks(src_docx_path)
-    units, unit_to_block_ids = build_translation_units(blocks, layout_mode=layout_mode)
-    chunk_spans = chunk_blocks_with_spans(
-        units,
-        max_chars=max_chars_per_chunk,
-        overlap=chunk_overlap,
+    blocks_list = list(iter_blocks(src_docx_path))
+
+    # NEW: Section-sized chunks first; fallback split if a section is too large
+    chunk_spans = build_section_chunks_with_fallback(
+        blocks_list,
+        max_section_chars=max_section_chars,
+        max_chars_per_chunk=max_chars_per_chunk,
+        chunk_overlap=chunk_overlap,
     )
+
     chunks = [c for (c, _, _) in chunk_spans]
+
+    # IMPORTANT: build_contexts needs a stable Sequence; use blocks_list (not an iterator)
     contexts_raw = build_contexts(
-        units,
+        blocks_list,
         [(s, e) for (_, s, e) in chunk_spans],
         context_chars=context_chars,
     )
     contexts = [{"before": b, "after": a} for (b, a) in contexts_raw]
-    print(
-        f"Finish chunking: {len(chunks)} chunks from {len(units)} units / {len(blocks)} blocks "
-        f"(context ±{context_chars} chars, layout_mode={layout_mode})"
-    )
+    print(f"Finish chunking: {len(chunks)} chunks (section-sized; fallback if > {max_section_chars} chars)")
 
     print("Build graph...")
     app = build_translation_graph()
@@ -830,22 +929,15 @@ def translate_docx(
             "base_url": base_url,
             "api_key": api_key,
             "target_lang": target_lang,
-
             "section": "default",
             "prompt_default": prompt_default,
             "prompt_claims": prompt_claims,
-            "prompt_claims_independent": prompt_claims_independent,
-            "prompt_claims_dependent": prompt_claims_dependent,
+            "prompt_claims_indep": prompt_claims_indep,
+            "prompt_claims_dep": prompt_claims_dep,
             "prompt_abstract": prompt_abstract,
-
             "abstract_word_count": 0,
             "last_abstract_block_id": None,
             "abstract_completed": False,
-            "abstract_block_ids": [],
-            "abstract_target_words": abstract_target_words,
-            "abstract_word_tolerance": abstract_word_tolerance,
-            "abstract_rewritten": False,
-
             "glossary": {},
             "prev_translated_text": "",
             "claim_preambles": {},
@@ -853,15 +945,10 @@ def translate_docx(
         config={"recursion_limit": max(50, len(chunks) * 3)},
     )
 
-    # Defensive finalization: if document ends while in abstract (or word count exists), finalize
+    # If the document ends while still in abstract (or word count exists), finalize again defensively
     if final.get("abstract_word_count", 0) or final.get("section") == "abstract":
         final = node_route_section({**final, "i": len(chunks)})
 
     print("Apply translations...")
-    block_translations = expand_unit_translations(
-        final["results"],
-        unit_to_block_ids,
-        layout_mode=layout_mode,
-    )
-    apply_translations_to_docx(src_docx_path, block_translations, out_docx_path)
+    apply_translations_to_docx(src_docx_path, final["results"], out_docx_path)
     print("Done.")
