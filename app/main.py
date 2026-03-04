@@ -132,11 +132,11 @@ async def translate_one(key: str, bucket, llm_config, semaphore) -> AttemptResul
                 max_section_chars=MAX_SECTION_CHARS,
                 base_url=llm_config.GPT_OSS_URL_API,
                 api_key="dummy",
-                prompt_default="patent_kr2en_body_v1",
-                prompt_claims="patent_kr2en_claims_v1",
-                prompt_claims_indep="patent_kr2en_claims_indep_v1",
-                prompt_claims_dep="patent_kr2en_claims_dep_v1",
-                prompt_abstract="patent_kr2en_abstract_v1",
+                prompt_default="patent_kr2en_body_v2_compact",
+                prompt_claims="patent_kr2en_claims_v2_compact",
+                prompt_claims_indep="patent_kr2en_claims_indep_v2_compact",
+                prompt_claims_dep="patent_kr2en_claims_dep_v2_compact",
+                prompt_abstract="patent_kr2en_abstract_v2_compact",
             )
             await loop.run_in_executor(None, task)
 

@@ -139,20 +139,13 @@ COMMON_USER = (
     "AFTER:\n${context_after}\n"
     "\n"
     "OUTPUT REQUIREMENTS:\n"
-    "- Return ONLY valid JSON (no markdown, no explanations).\n"
-    "- Use DOUBLE QUOTES for all JSON keys and strings.\n"
+    "- Return ONLY valid JSON (no markdown/explanations), using DOUBLE QUOTES.\n"
     '- Schema: {"translations":[{"id":"...","text":"..."}], "key_terms":[{"ko":"Korean term","en":"English term"}]}\n'
-    "- Keep the same number of items and preserve each id exactly.\n"
-    '- In "key_terms", list all significant technical terms (components, materials, processes, patent-specific noun phrases) you translated in this chunk.\n'
-    "  Do NOT include common words, particles, or grammatical function words.\n"
-    "\n"
-    "IMPORTANT:\n"
-    "- Output JSON ONLY. Do not wrap with BEGIN_JSON/END_JSON.\n"
+    '- In "key_terms", include significant technical terms only (exclude function words/common words).\n'
     "\n"
     "ID COVERAGE (CRITICAL):\n"
     "- You MUST output exactly ONE translations item per input item.\n"
     "- Every input \"id\" MUST appear EXACTLY ONCE in the output.\n"
-    "- NEVER omit an id.\n"
     "- If an item is a pure heading or has no translatable content, output \"text\":\"\" but keep the id.\n"
     "\n"
     "NO SUMMARIZATION (CRITICAL):\n"
@@ -200,42 +193,17 @@ PROMPT_PATENT_BODY = register_prompt(
 # ------------------------------------------------------------
 
 CLAIMS_STYLE_RULES = (
-    "CLAIMS STYLE (MATCH THESE EXAMPLES):\n"
+    "CLAIMS STYLE:\n"
+    "A) INDEPENDENT CLAIMS:\n"
+    "- Preferred preamble: 'A <category> performed by <actor>, the <category> comprising:'.\n"
+    "- Use gerunds for steps/elements; separate with ';' and '; and' before the last step.\n"
     "\n"
-    "A) INDEPENDENT CLAIMS (example pattern):\n"
-    "<N>. A <category> performed by <actor>, the <category> comprising:\n"
-    "  <step/element 1>;\n"
-    "  <step/element 2>; and\n"
-    "  <step/element 3>.\n"
+    "B) DEPENDENT CLAIMS:\n"
+    "- Start exactly: 'The <category> of claim <M>,' followed by limitations.\n"
+    "- Add limitations with one or more 'wherein ...' clauses.\n"
+    "- Do NOT restate the full independent claim.\n"
     "\n"
-    "Real example:\n"
-    "  12. A method performed by a user equipment, the method comprising:\n"
-    "    transmitting, to an external electronic device, device information related to a first target;\n"
-    "    receiving, from the external electronic device, streaming data based on the device information; and\n"
-    "    rendering the streaming data on a display.\n"
-    "\n"
-    "- Use 'A <category> performed by <actor>, the <category> comprising:' as the preamble.\n"
-    "- Use gerunds for method steps: 'transmitting', 'receiving', 'performing', 'generating', etc.\n"
-    "- Separate each step with ';' and use '; and' only before the final step.\n"
-    "- Keep dependency/conditions as 'in response to ...' inside the step.\n"
-    "- Put additional legal limitations in one or more 'wherein ...' clauses.\n"
-    "\n"
-    "B) DEPENDENT CLAIMS (example pattern):\n"
-    "<N>. The <category> of claim <M>,\n"
-    "  wherein <additional limitation>.\n"
-    "\n"
-    "Real example:\n"
-    "  13. The method of claim 12, wherein the transmitting of the device information to the external electronic device comprises\n"
-    "    transmitting capability information indicating a codec supported by the user equipment.\n"
-    "\n"
-    "- Start exactly with: 'The <category> of claim <M>,' (comma required).\n"
-    "- Reference steps from the parent claim using nominalized gerunds with 'the':\n"
-    "  e.g., 'the transmitting of ...', 'the receiving of ...'.\n"
-    "- Use one or more 'wherein ...' clauses to add limitations.\n"
-    "- If multiple wherein clauses exist, separate them using semicolons; use '; and' for the last one.\n"
-    "- Do NOT restate the entire independent claim; only add limitations.\n"
-    "\n"
-    "C) GENERAL CLAIM DRAFTING RULES:\n"
+    "C) GENERAL DRAFTING RULES:\n"
     "- Preserve claim numbers exactly.\n"
     "- Preserve dependency references (e.g., 'claim 12').\n"
     "- Keep each claim as ONE sentence where possible (use semicolons, commas).\n"
@@ -380,11 +348,8 @@ CLAIMS_USER = (
     "AFTER:\n${context_after}\n"
     "\n"
     "OUTPUT REQUIREMENTS:\n"
-    "- Return ONLY valid JSON (no markdown, no explanations).\n"
-    "- Use DOUBLE QUOTES for all JSON keys and strings.\n"
+    "- Return ONLY valid JSON (no markdown/explanations), using DOUBLE QUOTES.\n"
     '- Schema: {"translations":[{"id":"...","text":"..."}], "key_terms":[{"ko":"Korean term","en":"English term"}], "claim_preambles":[{"claim_num":"1","category":"method"}]}\n'
-    "- Preserve each id exactly.\n"
-    "- Keep the same number of output items as input items.\n"
     "\n"
     "ID COVERAGE (CRITICAL):\n"
     "- You MUST output exactly ONE translations item per input item.\n"
@@ -406,9 +371,6 @@ CLAIMS_USER = (
     '\nIn "claim_preambles", for each INDEPENDENT claim you translate, extract the claim number and its category '
     '(e.g., "method", "apparatus", "system", "device", "medium", "program"). '
     "Only include independent claims (ones that do NOT reference another claim).\n"
-    "\n"
-    "IMPORTANT:\n"
-    "- Output JSON ONLY. Do not wrap with BEGIN_JSON/END_JSON.\n"
     "\n"
     "TERM CONSISTENCY INSTRUCTIONS:\n"
     "- CRITICAL: If a term appears in ESTABLISHED TERMINOLOGY above, you MUST use that exact English translation.\n"
@@ -488,5 +450,125 @@ PROMPT_PATENT_CLAIMS_DEP = register_prompt(
             include_dependent_rules=True,
         ),
         user=CLAIMS_USER,
+    )
+)
+
+
+# ------------------------------------------------------------
+# 5) Compact prompt set (A/B trial)
+# ------------------------------------------------------------
+
+COMPACT_COMMON_USER = (
+    "Translate each INPUT JSON item from Korean to ${target_lang}.\n"
+    "Use context and terminology for consistency.\n"
+    "\n"
+    "PREVIOUS TRANSLATION:\n${prev_translation}\n"
+    "GLOSSARY:\n${glossary}\n"
+    "CONTEXT BEFORE:\n${context_before}\n"
+    "CONTEXT AFTER:\n${context_after}\n"
+    "\n"
+    "Return ONLY valid JSON with DOUBLE QUOTES.\n"
+    '- Schema: {"translations":[{"id":"...","text":"..."}], "key_terms":[{"ko":"...","en":"..."}]}\n'
+    "- Output exactly one translation item per input id; do not omit ids.\n"
+    "- If an item has no translatable content, keep id and set text to empty string.\n"
+    '- In "key_terms", include only significant technical terms.\n'
+    "- Do not summarize.\n"
+    "\n"
+    "INPUT:\n${payload_json}\n"
+)
+
+COMPACT_CLAIMS_USER = (
+    "Translate INPUT JSON into ${target_lang}. Section is CLAIMS.\n"
+    "A claim may span multiple items.\n"
+    "\n"
+    "PREVIOUS TRANSLATION:\n${prev_translation}\n"
+    "GLOSSARY:\n${glossary}\n"
+    "CLAIM PREAMBLES:\n${claim_preambles}\n"
+    "CONTEXT BEFORE:\n${context_before}\n"
+    "CONTEXT AFTER:\n${context_after}\n"
+    "\n"
+    "Return ONLY valid JSON with DOUBLE QUOTES.\n"
+    '- Schema: {"translations":[{"id":"...","text":"..."}], "key_terms":[{"ko":"...","en":"..."}], "claim_preambles":[{"claim_num":"1","category":"method"}]}\n'
+    "- Output exactly one translation item per input id; do not omit ids.\n"
+    "- Merge same-claim multi-item content into ONE coherent claim sentence.\n"
+    "- Put merged claim text only in first item of that claim; set remaining same-claim items to empty string.\n"
+    "- Never merge across different claim numbers.\n"
+    '- In "claim_preambles", include only independent claims as {"claim_num","category"}.\n'
+    "\n"
+    "INPUT:\n${payload_json}\n"
+)
+
+PROMPT_PATENT_BODY_COMPACT = register_prompt(
+    Prompt(
+        name="patent_kr2en_body_v2_compact",
+        system=(
+            COMMON_SYSTEM
+            + "\n"
+            "SECTION: DESCRIPTION (compact mode)\n"
+            "- Keep technical/legal fidelity.\n"
+            "- Preserve numbering, reference numerals, and structure.\n"
+        ),
+        user=COMPACT_COMMON_USER,
+    )
+)
+
+PROMPT_PATENT_ABSTRACT_COMPACT = register_prompt(
+    Prompt(
+        name="patent_kr2en_abstract_v2_compact",
+        system=(
+            COMMON_SYSTEM
+            + "\n"
+            "SECTION: ABSTRACT (compact mode)\n"
+            "- Keep concise and technical.\n"
+        ),
+        user=COMPACT_COMMON_USER,
+    )
+)
+
+PROMPT_PATENT_CLAIMS_COMPACT = register_prompt(
+    Prompt(
+        name="patent_kr2en_claims_v2_compact",
+        system=_compose_claims_system(
+            section_label="SECTION: CLAIMS (GENERAL, compact mode)",
+            section_intro="Use strict claim numbering/dependency style and single-sentence claim drafting.",
+            include_style_rules=True,
+            include_dependent_rules=True,
+            include_linebreak_rules=True,
+            include_additional_claim_rules=False,
+        ),
+        user=COMPACT_CLAIMS_USER,
+    )
+)
+
+PROMPT_PATENT_CLAIMS_INDEP_COMPACT = register_prompt(
+    Prompt(
+        name="patent_kr2en_claims_indep_v2_compact",
+        system=_compose_claims_system(
+            section_label="SECTION: CLAIMS — INDEPENDENT (compact mode)",
+            section_intro=(
+                "Start with '<N>. A <category> ... comprising:'. "
+                "Preserve scope and claim numbering."
+            ),
+            include_style_rules=False,
+            include_dependent_rules=False,
+            include_linebreak_rules=False,
+            include_additional_claim_rules=False,
+        ),
+        user=COMPACT_CLAIMS_USER,
+    )
+)
+
+PROMPT_PATENT_CLAIMS_DEP_COMPACT = register_prompt(
+    Prompt(
+        name="patent_kr2en_claims_dep_v2_compact",
+        system=_compose_claims_system(
+            section_label="SECTION: CLAIMS — DEPENDENT (compact mode)",
+            section_intro="Start exactly with 'The <category> of claim <M>, ...'.",
+            include_style_rules=False,
+            include_dependent_rules=True,
+            include_linebreak_rules=False,
+            include_additional_claim_rules=False,
+        ),
+        user=COMPACT_CLAIMS_USER,
     )
 )
