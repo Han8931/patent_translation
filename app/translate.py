@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import random
 import re
+import time
 from pathlib import Path
 from typing import TypedDict, List, Dict, Literal, Optional, Tuple
 from json import JSONDecodeError
@@ -309,6 +311,7 @@ def translate_chunk(
     glossary: Dict[str, str] | None = None,
     prev_translated_text: str = "",
     claim_preambles: Dict[str, str] | None = None,
+    retry_instruction: str = "",
 ) -> tuple[Dict[str, str], List[Dict[str, str]], Dict[str, str]]:
     """Translate a chunk and return (translations, key_terms, new_claim_preambles)."""
     prompt = PROMPTS[prompt_name]
@@ -328,6 +331,12 @@ def translate_chunk(
         prev_translation=prev_translation,
         claim_preambles=preambles_str,
     )
+    if retry_instruction:
+        user_prompt = (
+            f"{user_prompt}\n\n"
+            "RETRY VALIDATION (CRITICAL):\n"
+            f"{retry_instruction}\n"
+        )
 
     resp = client.chat.completions.create(
         model=model,
@@ -665,35 +674,74 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
 
     print(f"[{sec}] {i}-th chunk... (glossary: {len(glossary)} terms, preambles: {len(claim_preambles)})")
 
-    translated_map, key_terms, new_preambles = translate_chunk(
-        client=client,
-        model=state["model"],
-        prompt_name=prompt_name,
-        target_lang=state["target_lang"],
-        chunk=chunk,
-        context_before=ctx_before,
-        context_after=ctx_after,
-        glossary=glossary,
-        prev_translated_text=prev_translated_text,
-        claim_preambles=claim_preambles,
-    )
+    max_attempts = 3
+    translated_map: Dict[str, str] = {}
+    key_terms: List[Dict[str, str]] = []
+    new_preambles: Dict[str, str] = {}
+    missing_ids: List[str] = []
+    unexpected_ids: List[str] = []
+    best_score: Tuple[int, int] = (10**9, 10**9)
 
-    # -------------------------
-    # Claims: enforce merge + numbering (NEW)
-    # -------------------------
-    if sec == "claims":
-        translated_map = _move_first_nonempty_to_first_id(translated_map, chunk)
+    for attempt in range(1, max_attempts + 1):
+        retry_instruction = ""
+        if attempt > 1:
+            retry_instruction = (
+                "Return exactly one translations item per input id. "
+                "Do not add new ids, do not remove ids, and keep each input id exactly once. "
+                "If content is non-translatable, keep the id and set text to an empty string."
+            )
 
-        claim_num = _extract_claim_number_from_chunk(chunk)
-        if claim_num and chunk:
-            first_id = chunk[0].id
-            translated_map[first_id] = _ensure_claim_number_prefix(translated_map.get(first_id, ""), claim_num)
+        cand_map, cand_terms, cand_preambles = translate_chunk(
+            client=client,
+            model=state["model"],
+            prompt_name=prompt_name,
+            target_lang=state["target_lang"],
+            chunk=chunk,
+            context_before=ctx_before,
+            context_after=ctx_after,
+            glossary=glossary,
+            prev_translated_text=prev_translated_text,
+            claim_preambles=claim_preambles,
+            retry_instruction=retry_instruction,
+        )
 
-    translated_map, missing_ids, unexpected_ids = _normalize_translations_for_chunk(
-        chunk=chunk,
-        translated_map=translated_map,
-        section=sec,
-    )
+        # -------------------------
+        # Claims: enforce merge + numbering (NEW)
+        # -------------------------
+        if sec == "claims":
+            cand_map = _move_first_nonempty_to_first_id(cand_map, chunk)
+
+            claim_num = _extract_claim_number_from_chunk(chunk)
+            if claim_num and chunk:
+                first_id = chunk[0].id
+                cand_map[first_id] = _ensure_claim_number_prefix(cand_map.get(first_id, ""), claim_num)
+
+        cand_map, cand_missing, cand_unexpected = _normalize_translations_for_chunk(
+            chunk=chunk,
+            translated_map=cand_map,
+            section=sec,
+        )
+        cand_score = (len(cand_missing) + len(cand_unexpected), len(cand_unexpected))
+        if cand_score < best_score:
+            best_score = cand_score
+            translated_map = cand_map
+            key_terms = cand_terms
+            new_preambles = cand_preambles
+            missing_ids = cand_missing
+            unexpected_ids = cand_unexpected
+
+        if not cand_missing and not cand_unexpected:
+            break
+
+        if attempt < max_attempts:
+            delay = (0.8 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
+            print(
+                f"[RETRY] chunk {i}: id mismatch on attempt {attempt}/{max_attempts} "
+                f"(missing={len(cand_missing)}, unexpected={len(cand_unexpected)}). "
+                f"retrying in {delay:.2f}s"
+            )
+            time.sleep(delay)
+
     if missing_ids or unexpected_ids:
         print(
             f"[WARN] chunk {i}: normalized translation ids "
