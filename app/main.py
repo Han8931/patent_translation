@@ -19,6 +19,7 @@ from app.model.data_schemas import Bucket
 
 MAX_CONCURRENCY = 5  # target 4–5 concurrent docs
 OUTPUT_DIR = Path("./outputs")
+FAILED_KEYS_PATH = OUTPUT_DIR / "failed_keys.txt"
 
 MAX_SECTION_CHARS = 80_000
 S3_PREFIX = "patent/260227"
@@ -50,6 +51,25 @@ def backoff_delay(attempt_idx: int) -> float:
     delay = min(MAX_BACKOFF_SEC, BASE_BACKOFF_SEC * (2 ** attempt_idx))
     delay += random.uniform(0, JITTER_SEC)
     return delay
+
+
+def load_failed_keys(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    keys: List[str] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            key = line.strip()
+            if key:
+                keys.append(key)
+    return list(dict.fromkeys(keys))
+
+
+def save_failed_keys(path: Path, keys: List[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for key in keys:
+            f.write(f"{key}\n")
 
 
 @dataclass
@@ -190,20 +210,27 @@ def print_round_summary(round_idx: int, results: List[AttemptResult]) -> None:
 # Entry
 # ============================================================
 
-async def main():
+async def main(*, retry_failed: bool = False, failed_keys_path: Path = FAILED_KEYS_PATH):
     config = APIConfig()
     llm_config = LLMModel()
     bucket = make_bucket(config)
 
-    keys = list_s3_keys(
-        bucket=bucket,
-        prefix=S3_PREFIX,
-        suffix=".docx",
-    )
+    if retry_failed:
+        keys = load_failed_keys(failed_keys_path)
+        if not keys:
+            print(f"No failed keys found in {failed_keys_path}")
+            return
+        print(f"[RETRY_FAILED] Loaded {len(keys)} keys from {failed_keys_path}")
+    else:
+        keys = list_s3_keys(
+            bucket=bucket,
+            prefix=S3_PREFIX,
+            suffix=".docx",
+        )
 
-    if not keys:
-        print(f"No .docx found under s3://{bucket.name}/{S3_PREFIX}")
-        return
+        if not keys:
+            print(f"No .docx found under s3://{bucket.name}/{S3_PREFIX}")
+            return
 
     keys = [str(k) for k in keys]
     keys.sort()
@@ -240,6 +267,8 @@ async def main():
 
     print("\n===== FINAL SUMMARY =====")
     print(f"TOTAL: {len(final_by_key)} | OK: {len(final_ok)} | FAILED: {len(final_fail)}")
+    save_failed_keys(failed_keys_path, final_fail)
+    print(f"Failed key list saved: {failed_keys_path} ({len(final_fail)} item(s))")
     if final_fail:
         print("Still failing:")
         for k in final_fail:

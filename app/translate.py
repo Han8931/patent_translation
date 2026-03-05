@@ -65,6 +65,10 @@ class TranslateState(TypedDict):
     # cross-chunk context for claim preambles
     claim_preambles: Dict[str, str]  # claim number → category (e.g. "1" → "method")
 
+    # id-shape quality tracking (mismatch after retry attempts)
+    id_mismatch_detected: bool
+    id_mismatch_chunks: List[str]
+
 
 def node_postprocess_claims(state: TranslateState) -> TranslateState:
     """
@@ -671,6 +675,8 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     glossary = dict(state.get("glossary", {}))
     prev_translated_text = state.get("prev_translated_text", "")
     claim_preambles = dict(state.get("claim_preambles", {}))
+    id_mismatch_detected = bool(state.get("id_mismatch_detected", False))
+    id_mismatch_chunks = list(state.get("id_mismatch_chunks", []))
 
     print(f"[{sec}] {i}-th chunk... (glossary: {len(glossary)} terms, preambles: {len(claim_preambles)})")
 
@@ -747,6 +753,10 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
             f"[WARN] chunk {i}: normalized translation ids "
             f"(missing={len(missing_ids)}, unexpected={len(unexpected_ids)})"
         )
+        id_mismatch_detected = True
+        id_mismatch_chunks.append(
+            f"chunk={i}, section={sec}, missing={len(missing_ids)}, unexpected={len(unexpected_ids)}"
+        )
 
     results = dict(state["results"])
     results.update(translated_map)
@@ -789,6 +799,8 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         "glossary": glossary,
         "prev_translated_text": new_prev,
         "claim_preambles": claim_preambles,
+        "id_mismatch_detected": id_mismatch_detected,
+        "id_mismatch_chunks": id_mismatch_chunks,
     }
 
 
@@ -1001,6 +1013,8 @@ def translate_docx(
             "glossary": {},
             "prev_translated_text": "",
             "claim_preambles": {},
+            "id_mismatch_detected": False,
+            "id_mismatch_chunks": [],
         },
         config={"recursion_limit": max(50, len(chunks) * 3)},
     )
@@ -1008,6 +1022,10 @@ def translate_docx(
     # If the document ends while still in abstract (or word count exists), finalize again defensively
     if final.get("abstract_word_count", 0) or final.get("section") == "abstract":
         final = node_route_section({**final, "i": len(chunks)})
+
+    if final.get("id_mismatch_detected"):
+        details = "; ".join(final.get("id_mismatch_chunks", []))
+        raise RuntimeError(f"ID mismatch detected after retries: {details}")
 
     print("Apply translations...")
     apply_translations_to_docx(src_docx_path, final["results"], out_docx_path)
