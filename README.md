@@ -8,6 +8,17 @@ uv run python main.py
 
 This runs the full batch from the configured S3 prefix and saves outputs to `outputs/`.
 
+### Enable source-vs-translation compare reports
+
+```bash
+uv run python main.py --compare
+```
+
+When enabled, each translated document produces:
+
+- `outputs/comparisons/<docname>.compare.chunks.md` (chunk-level source vs translation)
+- `outputs/comparisons/<docname>.compare.lines.tsv` (line-level mapping by block id)
+
 ### Retry only failed documents
 
 ```bash

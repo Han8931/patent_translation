@@ -17,6 +17,11 @@ def parse_args():
         default="outputs/failed_keys.txt",
         help="Path to failed key list file (default: outputs/failed_keys.txt)",
     )
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Generate source-vs-translation comparison reports (chunk and line level)",
+    )
     return parser.parse_args()
 
 
@@ -26,5 +31,6 @@ if __name__ == "__main__":
         run_main(
             retry_failed=args.retry_failed,
             failed_keys_path=Path(args.failed_list),
+            compare=args.compare,
         )
     )

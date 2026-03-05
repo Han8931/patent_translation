@@ -7,6 +7,7 @@ import random
 import re
 import time
 from pathlib import Path
+from datetime import datetime
 from typing import TypedDict, List, Dict, Literal, Optional, Tuple
 from json import JSONDecodeError
 
@@ -954,7 +955,109 @@ def apply_translations_to_docx(
 
 
 # ============================================================
-# 8) End-to-end runner
+# 8) Comparison report
+# ============================================================
+
+
+def _escape_markdown_cell(text: str) -> str:
+    return (text or "").replace("\n", "<br>").replace("|", r"\|")
+
+
+def _escape_tsv_cell(text: str) -> str:
+    return (text or "").replace("\t", " ").replace("\n", "\\n")
+
+
+def write_comparison_reports(
+    *,
+    src_docx_path: str | Path,
+    out_docx_path: str | Path,
+    chunks: List[List[Block]],
+    chunk_spans: List[tuple[List[Block], int, int]],
+    translations: Dict[str, str],
+) -> tuple[Path, Path]:
+    """
+    Write comparison reports for debugging/review:
+    - chunk-level markdown: source vs translated per chunk
+    - line-level tsv: one row per block
+    """
+    out_docx_path = Path(out_docx_path)
+    compare_dir = out_docx_path.parent / "comparisons"
+    compare_dir.mkdir(parents=True, exist_ok=True)
+
+    base = out_docx_path.stem
+    chunk_md_path = compare_dir / f"{base}.compare.chunks.md"
+    line_tsv_path = compare_dir / f"{base}.compare.lines.tsv"
+
+    created_at = datetime.now().isoformat(timespec="seconds")
+
+    md_lines: List[str] = [
+        f"# Comparison Report: {base}",
+        "",
+        f"- Created: {created_at}",
+        f"- Source: {Path(src_docx_path)}",
+        f"- Output: {out_docx_path}",
+        f"- Total chunks: {len(chunks)}",
+        "",
+    ]
+
+    tsv_lines: List[str] = [
+        "chunk_idx\tline_in_chunk\tblock_id\tsource_text\ttranslated_text"
+    ]
+
+    for chunk_idx, (chunk, (_chunk_blocks, s, e)) in enumerate(zip(chunks, chunk_spans), start=1):
+        src_lines = [(b.text or "") for b in chunk]
+        tgt_lines = [(translations.get(b.id, "") or "") for b in chunk]
+
+        src_chunk_text = "\n".join(src_lines).strip()
+        tgt_chunk_text = "\n".join(tgt_lines).strip()
+
+        md_lines.extend(
+            [
+                f"## Chunk {chunk_idx} (blocks[{s}:{e}], lines={len(chunk)})",
+                "",
+                "### Source",
+                "```text",
+                src_chunk_text,
+                "```",
+                "",
+                "### Translation",
+                "```text",
+                tgt_chunk_text,
+                "```",
+                "",
+                "| Block ID | Source | Translation |",
+                "| --- | --- | --- |",
+            ]
+        )
+
+        for line_in_chunk, b in enumerate(chunk, start=1):
+            source_text = b.text or ""
+            translated_text = translations.get(b.id, "") or ""
+            md_lines.append(
+                f"| {b.id} | {_escape_markdown_cell(source_text)} | {_escape_markdown_cell(translated_text)} |"
+            )
+
+            tsv_lines.append(
+                "\t".join(
+                    [
+                        str(chunk_idx),
+                        str(line_in_chunk),
+                        b.id,
+                        _escape_tsv_cell(source_text),
+                        _escape_tsv_cell(translated_text),
+                    ]
+                )
+            )
+
+        md_lines.append("")
+
+    chunk_md_path.write_text("\n".join(md_lines), encoding="utf-8")
+    line_tsv_path.write_text("\n".join(tsv_lines) + "\n", encoding="utf-8")
+    return chunk_md_path, line_tsv_path
+
+
+# ============================================================
+# 9) End-to-end runner
 # ============================================================
 
 
@@ -974,6 +1077,7 @@ def translate_docx(
     prompt_claims_indep: str = "patent_kr2en_claims_indep_v1",
     prompt_claims_dep: str = "patent_kr2en_claims_dep_v1",
     prompt_abstract: str = "patent_kr2en_abstract_v1",
+    compare: bool = False,
     # NEW: "whole-section" mode with adaptive fallback
     max_section_chars: int = 80_000,
 ) -> None:
@@ -1041,4 +1145,16 @@ def translate_docx(
 
     print("Apply translations...")
     apply_translations_to_docx(src_docx_path, final["results"], out_docx_path)
+
+    if compare:
+        chunk_md_path, line_tsv_path = write_comparison_reports(
+            src_docx_path=src_docx_path,
+            out_docx_path=out_docx_path,
+            chunks=chunks,
+            chunk_spans=chunk_spans,
+            translations=final["results"],
+        )
+        print(f"[COMPARE] Chunk report: {chunk_md_path}")
+        print(f"[COMPARE] Line report: {line_tsv_path}")
+
     print("Done.")

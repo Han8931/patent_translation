@@ -102,7 +102,7 @@ async def _retry_async(fn, *, retries: int, what: str) -> Tuple[bool, Optional[s
     return False, last_err
 
 
-async def translate_one(key: str, bucket, llm_config, semaphore) -> AttemptResult:
+async def translate_one(key: str, bucket, llm_config, semaphore, *, compare: bool = False) -> AttemptResult:
     async with semaphore:
         key = str(key)
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -144,6 +144,7 @@ async def translate_one(key: str, bucket, llm_config, semaphore) -> AttemptResul
                 translate_docx,
                 src_docx_path=local_path,
                 out_docx_path=out_path,
+                compare=compare,
                 model="gpt-oss-120b",
                 target_lang="English",
                 max_chars_per_chunk=5000,
@@ -181,9 +182,19 @@ async def translate_one(key: str, bucket, llm_config, semaphore) -> AttemptResul
         )
 
 
-async def run_round(keys: List[str], bucket, llm_config, concurrency: int) -> Tuple[List[AttemptResult], List[str]]:
+async def run_round(
+    keys: List[str],
+    bucket,
+    llm_config,
+    concurrency: int,
+    *,
+    compare: bool = False,
+) -> Tuple[List[AttemptResult], List[str]]:
     sem = asyncio.Semaphore(concurrency)
-    tasks = [asyncio.create_task(translate_one(k, bucket, llm_config, sem)) for k in keys]
+    tasks = [
+        asyncio.create_task(translate_one(k, bucket, llm_config, sem, compare=compare))
+        for k in keys
+    ]
     results: List[AttemptResult] = await asyncio.gather(*tasks)
 
     failed = [r.key for r in results if not r.ok]
@@ -210,7 +221,12 @@ def print_round_summary(round_idx: int, results: List[AttemptResult]) -> None:
 # Entry
 # ============================================================
 
-async def main(*, retry_failed: bool = False, failed_keys_path: Path = FAILED_KEYS_PATH):
+async def main(
+    *,
+    retry_failed: bool = False,
+    failed_keys_path: Path = FAILED_KEYS_PATH,
+    compare: bool = False,
+):
     config = APIConfig()
     llm_config = LLMModel()
     bucket = make_bucket(config)
@@ -244,7 +260,13 @@ async def main(*, retry_failed: bool = False, failed_keys_path: Path = FAILED_KE
     concurrency = min(MAX_CONCURRENCY, max(1, len(keys)))
 
     # Round 0: try everything once
-    results0, failed = await run_round(keys, bucket, llm_config, concurrency)
+    results0, failed = await run_round(
+        keys,
+        bucket,
+        llm_config,
+        concurrency,
+        compare=compare,
+    )
     print_round_summary(0, results0)
 
     # Retry rounds: only failed docs
@@ -253,7 +275,13 @@ async def main(*, retry_failed: bool = False, failed_keys_path: Path = FAILED_KE
         if not failed:
             break
         print(f"\n>>> Retrying {len(failed)} failed docs (round {r}/{RETRY_ROUNDS})...")
-        results_r, failed = await run_round(failed, bucket, llm_config, concurrency)
+        results_r, failed = await run_round(
+            failed,
+            bucket,
+            llm_config,
+            concurrency,
+            compare=compare,
+        )
         all_results.extend(results_r)
         print_round_summary(r, results_r)
 
