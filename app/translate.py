@@ -678,6 +678,18 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     id_mismatch_detected = bool(state.get("id_mismatch_detected", False))
     id_mismatch_chunks = list(state.get("id_mismatch_chunks", []))
 
+    # Skip pure-empty chunks to avoid pointless LLM calls and empty JSON responses.
+    if all(not (b.text or "").strip() for b in chunk):
+        results = dict(state["results"])
+        for b in chunk:
+            results[b.id] = b.text or ""
+        print(f"[SKIP] chunk {i}: all blocks are empty/whitespace")
+        return {
+            **state,
+            "results": results,
+            "i": i + 1,
+        }
+
     print(f"[{sec}] {i}-th chunk... (glossary: {len(glossary)} terms, preambles: {len(claim_preambles)})")
 
     max_attempts = 3
