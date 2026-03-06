@@ -971,16 +971,25 @@ def write_comparison_reports(
     *,
     src_docx_path: str | Path,
     out_docx_path: str | Path,
-    chunks: List[List[Block]],
     chunk_spans: List[tuple[List[Block], int, int]],
-    translations: Dict[str, str],
 ) -> tuple[Path, Path]:
     """
     Write comparison reports for debugging/review:
     - chunk-level markdown: source vs translated per chunk
     - line-level tsv: one row per block
     """
+    src_docx_path = Path(src_docx_path)
     out_docx_path = Path(out_docx_path)
+
+    source_blocks = iter_blocks(src_docx_path)
+    output_blocks = iter_blocks(out_docx_path)
+    source_by_id = {b.id: (b.text or "") for b in source_blocks}
+    output_by_id = {b.id: (b.text or "") for b in output_blocks}
+    source_ids = set(source_by_id.keys())
+    output_ids = set(output_by_id.keys())
+    missing_in_output = sorted(source_ids - output_ids)
+    extra_in_output = sorted(output_ids - source_ids)
+
     compare_dir = out_docx_path.parent / "comparisons"
     compare_dir.mkdir(parents=True, exist_ok=True)
 
@@ -994,19 +1003,23 @@ def write_comparison_reports(
         f"# Comparison Report: {base}",
         "",
         f"- Created: {created_at}",
-        f"- Source: {Path(src_docx_path)}",
-        f"- Output: {out_docx_path}",
-        f"- Total chunks: {len(chunks)}",
+        f"- Source DOCX: {src_docx_path}",
+        f"- Output DOCX: {out_docx_path}",
+        f"- Source blocks: {len(source_blocks)}",
+        f"- Output blocks: {len(output_blocks)}",
+        f"- Total chunks: {len(chunk_spans)}",
+        f"- Missing blocks in output: {len(missing_in_output)}",
+        f"- Extra blocks in output: {len(extra_in_output)}",
         "",
     ]
 
     tsv_lines: List[str] = [
-        "chunk_idx\tline_in_chunk\tblock_id\tsource_text\ttranslated_text"
+        "chunk_idx\tline_in_chunk\tblock_id\tmatch_status\tsource_text\ttranslated_text"
     ]
 
-    for chunk_idx, (chunk, (_chunk_blocks, s, e)) in enumerate(zip(chunks, chunk_spans), start=1):
-        src_lines = [(b.text or "") for b in chunk]
-        tgt_lines = [(translations.get(b.id, "") or "") for b in chunk]
+    for chunk_idx, (chunk, s, e) in enumerate(chunk_spans, start=1):
+        src_lines = [source_by_id.get(b.id, "") for b in chunk]
+        tgt_lines = [output_by_id.get(b.id, "") for b in chunk]
 
         src_chunk_text = "\n".join(src_lines).strip()
         tgt_chunk_text = "\n".join(tgt_lines).strip()
@@ -1031,8 +1044,9 @@ def write_comparison_reports(
         )
 
         for line_in_chunk, b in enumerate(chunk, start=1):
-            source_text = b.text or ""
-            translated_text = translations.get(b.id, "") or ""
+            source_text = source_by_id.get(b.id, "")
+            translated_text = output_by_id.get(b.id, "")
+            match_status = "matched" if b.id in output_by_id else "missing_in_output"
             md_lines.append(
                 f"| {b.id} | {_escape_markdown_cell(source_text)} | {_escape_markdown_cell(translated_text)} |"
             )
@@ -1043,12 +1057,63 @@ def write_comparison_reports(
                         str(chunk_idx),
                         str(line_in_chunk),
                         b.id,
+                        match_status,
                         _escape_tsv_cell(source_text),
                         _escape_tsv_cell(translated_text),
                     ]
                 )
             )
 
+        md_lines.append("")
+
+    if missing_in_output:
+        md_lines.extend(
+            [
+                "## Unmatched: Missing In Output",
+                "",
+                "| Block ID | Source |",
+                "| --- | --- |",
+            ]
+        )
+        for bid in missing_in_output:
+            md_lines.append(f"| {bid} | {_escape_markdown_cell(source_by_id.get(bid, ''))} |")
+            tsv_lines.append(
+                "\t".join(
+                    [
+                        "NA",
+                        "NA",
+                        bid,
+                        "missing_in_output",
+                        _escape_tsv_cell(source_by_id.get(bid, "")),
+                        "",
+                    ]
+                )
+            )
+        md_lines.append("")
+
+    if extra_in_output:
+        md_lines.extend(
+            [
+                "## Unmatched: Extra In Output",
+                "",
+                "| Block ID | Output |",
+                "| --- | --- |",
+            ]
+        )
+        for bid in extra_in_output:
+            md_lines.append(f"| {bid} | {_escape_markdown_cell(output_by_id.get(bid, ''))} |")
+            tsv_lines.append(
+                "\t".join(
+                    [
+                        "NA",
+                        "NA",
+                        bid,
+                        "extra_in_output",
+                        "",
+                        _escape_tsv_cell(output_by_id.get(bid, "")),
+                    ]
+                )
+            )
         md_lines.append("")
 
     chunk_md_path.write_text("\n".join(md_lines), encoding="utf-8")
@@ -1150,9 +1215,7 @@ def translate_docx(
         chunk_md_path, line_tsv_path = write_comparison_reports(
             src_docx_path=src_docx_path,
             out_docx_path=out_docx_path,
-            chunks=chunks,
             chunk_spans=chunk_spans,
-            translations=final["results"],
         )
         print(f"[COMPARE] Chunk report: {chunk_md_path}")
         print(f"[COMPARE] Line report: {line_tsv_path}")
