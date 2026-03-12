@@ -8,7 +8,7 @@ uv run python main.py
 
 This runs the full batch from the configured S3 prefix and saves outputs to `outputs/`.
 
-### Enable source-vs-translation compare reports
+### Enable source-vs-output compare reports
 
 ```bash
 uv run python main.py --compare
@@ -16,8 +16,44 @@ uv run python main.py --compare
 
 When enabled, each translated document produces:
 
-- `outputs/comparisons/<docname>.compare.chunks.md` (chunk-level source vs translation)
-- `outputs/comparisons/<docname>.compare.lines.tsv` (line-level mapping by block id)
+- `outputs/comparisons/<docname>.compare.chunks.md`
+- `outputs/comparisons/<docname>.compare.lines.tsv`
+
+Comparison is built from the actual DOCX files:
+
+- Source DOCX (downloaded original)
+- Output DOCX (final translated file in `outputs/`)
+
+Report details:
+
+- Chunk-level source/output text comparison
+- Line-level comparison by block ID (`p:*`, `cell:*`)
+- Unmatched block detection:
+  - missing in output
+  - extra in output
+- TSV `match_status` values:
+  - `matched`
+  - `missing_in_output`
+  - `extra_in_output`
+
+You can combine retry + compare:
+
+```bash
+uv run python main.py --retry_failed --compare
+```
+
+### Compare only (reuse existing translated DOCX)
+
+If you already have a translated DOCX, generate compare reports without rerunning translation:
+
+```bash
+uv run python main.py --compare_only --src_docx <source.docx> --translated_docx <translated.docx>
+```
+
+This still writes:
+
+- `outputs/comparisons/<docname>.compare.chunks.md`
+- `outputs/comparisons/<docname>.compare.lines.tsv`
 
 ### Retry only failed documents
 

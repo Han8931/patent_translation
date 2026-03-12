@@ -1121,6 +1121,35 @@ def write_comparison_reports(
     return chunk_md_path, line_tsv_path
 
 
+def generate_compare_reports_for_docx(
+    *,
+    src_docx_path: str | Path,
+    out_docx_path: str | Path,
+    max_section_chars: int = 80_000,
+    max_chars_per_chunk: int = 5000,
+    chunk_overlap: int = 0,
+) -> tuple[Path, Path]:
+    """
+    Compare an existing source DOCX and translated DOCX without rerunning translation.
+    Returns (chunk_markdown_path, line_tsv_path).
+    """
+    src_docx_path = Path(src_docx_path)
+    out_docx_path = Path(out_docx_path)
+
+    blocks_list = list(iter_blocks(src_docx_path))
+    chunk_spans = build_section_chunks_with_fallback(
+        blocks_list,
+        max_section_chars=max_section_chars,
+        max_chars_per_chunk=max_chars_per_chunk,
+        chunk_overlap=chunk_overlap,
+    )
+    return write_comparison_reports(
+        src_docx_path=src_docx_path,
+        out_docx_path=out_docx_path,
+        chunk_spans=chunk_spans,
+    )
+
+
 # ============================================================
 # 9) End-to-end runner
 # ============================================================
