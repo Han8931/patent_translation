@@ -146,7 +146,9 @@ COMMON_USER = (
     "ID COVERAGE (CRITICAL):\n"
     "- You MUST output exactly ONE translations item per input item.\n"
     "- Every input \"id\" MUST appear EXACTLY ONCE in the output.\n"
-    "- If an item is a pure heading or has no translatable content, output \"text\":\"\" but keep the id.\n"
+    "- For any non-empty input text, output non-empty translated text.\n"
+    "- Do NOT output empty text for headings (e.g., ABSTRACT, CLAIMS, TECHNICAL FIELD).\n"
+    "- Only output \"text\":\"\" when the input text is truly empty/whitespace.\n"
     "\n"
     "NO SUMMARIZATION (CRITICAL):\n"
     "- Do NOT summarize, compress, or rewrite.\n"
@@ -470,7 +472,9 @@ COMPACT_COMMON_USER = (
     "Return ONLY valid JSON with DOUBLE QUOTES.\n"
     '- Schema: {"translations":[{"id":"...","text":"..."}], "key_terms":[{"ko":"...","en":"..."}]}\n'
     "- Output exactly one translation item per input id; do not omit ids.\n"
-    "- If an item has no translatable content, keep id and set text to empty string.\n"
+    "- For any non-empty input text, output non-empty translated text.\n"
+    "- Do NOT output empty text for headings.\n"
+    "- Only use empty text when the input text is truly empty/whitespace.\n"
     '- In "key_terms", include only significant technical terms.\n'
     "- Do not summarize.\n"
     "\n"
@@ -493,6 +497,7 @@ COMPACT_CLAIMS_USER = (
     "- Merge same-claim multi-item content into ONE coherent claim sentence.\n"
     "- Put merged claim text only in first item of that claim; set remaining same-claim items to empty string.\n"
     "- Never merge across different claim numbers.\n"
+    "- For claim header/first item with non-empty input, output non-empty text.\n"
     '- In "claim_preambles", include only independent claims as {"claim_num","category"}.\n'
     "\n"
     "INPUT:\n${payload_json}\n"

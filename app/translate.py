@@ -69,6 +69,9 @@ class TranslateState(TypedDict):
     # id-shape quality tracking (mismatch after retry attempts)
     id_mismatch_detected: bool
     id_mismatch_chunks: List[str]
+    # quality tracking: empty model output replaced with source text
+    empty_fallback_count: int
+    empty_fallback_chunks: List[str]
 
 
 def node_postprocess_claims(state: TranslateState) -> TranslateState:
@@ -505,17 +508,6 @@ def node_route_section(state: TranslateState) -> TranslateState:
     curr_chunk = state["chunks"][i]
     new = detect_section_from_chunk(prev, curr_chunk)
 
-    # Abstract should end at the abstract section boundary.
-    # If we are already in abstract mode but the current chunk does not include
-    # an abstract heading, route out so word-count suffix is attached near the
-    # actual abstract instead of trailing to the document end.
-    if prev == "abstract" and not _has_abstract_heading(curr_chunk):
-        new = "default"
-
-    # once abstract is completed and we are past it, revert to default/spec handling
-    if prev == "abstract" and state.get("abstract_completed"):
-        new = "default"
-
     if prev == "abstract" and new != "abstract":
         finalized = finalize_abstract_word_count(state)
         if finalized is not state:
@@ -617,7 +609,7 @@ def _normalize_translations_for_chunk(
     chunk: List[Block],
     translated_map: Dict[str, str],
     section: Section,
-) -> tuple[Dict[str, str], List[str], List[str]]:
+) -> tuple[Dict[str, str], List[str], List[str], List[str]]:
     """
     Ensure exactly one output entry per input block id.
     - Drops unexpected ids from model output.
@@ -631,9 +623,25 @@ def _normalize_translations_for_chunk(
     missing = [bid for bid in expected_ids if bid not in translated_map]
 
     normalized: Dict[str, str] = {}
+    fallback_ids: List[str] = []
     for bid in expected_ids:
+        src_text = source_by_id[bid]
+        src_nonempty = bool(src_text.strip())
+
         if bid in translated_map:
-            normalized[bid] = translated_map[bid]
+            out_text = str(translated_map[bid] or "")
+
+            # Guardrail: non-empty source should not become empty output.
+            # Exception: claims mode intentionally allows empty non-first ids
+            # when a merged claim body is stored in the first id.
+            if not out_text.strip() and src_nonempty:
+                if section == "claims" and bid != expected_ids[0]:
+                    normalized[bid] = ""
+                else:
+                    normalized[bid] = src_text
+                    fallback_ids.append(bid)
+            else:
+                normalized[bid] = out_text
             continue
 
         # Claims mode intentionally allows empty non-first items due merge rules.
@@ -642,6 +650,8 @@ def _normalize_translations_for_chunk(
         else:
             # Prefer preserving source text over silent drops.
             normalized[bid] = source_by_id[bid]
+            if src_nonempty:
+                fallback_ids.append(bid)
 
     # Claims guard: first item should never be blank when possible.
     if section == "claims" and expected_ids:
@@ -657,7 +667,7 @@ def _normalize_translations_for_chunk(
             if not (normalized.get(first_id) or "").strip():
                 normalized[first_id] = source_by_id[first_id]
 
-    return normalized, missing, unexpected
+    return normalized, missing, unexpected, fallback_ids
 
 
 def _translate_with_prompt(state: TranslateState, prompt_name: str) -> TranslateState:
@@ -678,6 +688,8 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     claim_preambles = dict(state.get("claim_preambles", {}))
     id_mismatch_detected = bool(state.get("id_mismatch_detected", False))
     id_mismatch_chunks = list(state.get("id_mismatch_chunks", []))
+    empty_fallback_count = int(state.get("empty_fallback_count", 0))
+    empty_fallback_chunks = list(state.get("empty_fallback_chunks", []))
 
     # Skip pure-empty chunks to avoid pointless LLM calls and empty JSON responses.
     if all(not (b.text or "").strip() for b in chunk):
@@ -699,6 +711,7 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     new_preambles: Dict[str, str] = {}
     missing_ids: List[str] = []
     unexpected_ids: List[str] = []
+    fallback_ids: List[str] = []
     best_score: Tuple[int, int] = (10**9, 10**9)
 
     for attempt in range(1, max_attempts + 1):
@@ -707,7 +720,8 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
             retry_instruction = (
                 "Return exactly one translations item per input id. "
                 "Do not add new ids, do not remove ids, and keep each input id exactly once. "
-                "If content is non-translatable, keep the id and set text to an empty string."
+                "For non-empty input text, do NOT return an empty text. "
+                "Only return empty text when the input is actually empty/whitespace."
             )
 
         cand_map, cand_terms, cand_preambles = translate_chunk(
@@ -735,12 +749,16 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
                 first_id = chunk[0].id
                 cand_map[first_id] = _ensure_claim_number_prefix(cand_map.get(first_id, ""), claim_num)
 
-        cand_map, cand_missing, cand_unexpected = _normalize_translations_for_chunk(
+        cand_map, cand_missing, cand_unexpected, cand_fallback_ids = _normalize_translations_for_chunk(
             chunk=chunk,
             translated_map=cand_map,
             section=sec,
         )
-        cand_score = (len(cand_missing) + len(cand_unexpected), len(cand_unexpected))
+        critical_fallbacks = len(cand_fallback_ids) if sec != "claims" else 0
+        cand_score = (
+            len(cand_missing) + len(cand_unexpected) + critical_fallbacks,
+            len(cand_unexpected),
+        )
         if cand_score < best_score:
             best_score = cand_score
             translated_map = cand_map
@@ -748,15 +766,17 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
             new_preambles = cand_preambles
             missing_ids = cand_missing
             unexpected_ids = cand_unexpected
+            fallback_ids = cand_fallback_ids
 
-        if not cand_missing and not cand_unexpected:
+        if not cand_missing and not cand_unexpected and critical_fallbacks == 0:
             break
 
         if attempt < max_attempts:
             delay = (0.8 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
             print(
                 f"[RETRY] chunk {i}: id mismatch on attempt {attempt}/{max_attempts} "
-                f"(missing={len(cand_missing)}, unexpected={len(cand_unexpected)}). "
+                f"(missing={len(cand_missing)}, unexpected={len(cand_unexpected)}, "
+                f"empty_fallback={critical_fallbacks}). "
                 f"retrying in {delay:.2f}s"
             )
             time.sleep(delay)
@@ -769,6 +789,21 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         id_mismatch_detected = True
         id_mismatch_chunks.append(
             f"chunk={i}, section={sec}, missing={len(missing_ids)}, unexpected={len(unexpected_ids)}"
+        )
+
+    if fallback_ids:
+        print(
+            f"[WARN] chunk {i}: empty translation fallback applied to "
+            f"{len(fallback_ids)} block(s)"
+        )
+        if sec != "claims":
+            raise RuntimeError(
+                f"Non-claims empty/missing translation detected after retries "
+                f"(chunk={i}, section={sec}, blocks={len(fallback_ids)})"
+            )
+        empty_fallback_count += len(fallback_ids)
+        empty_fallback_chunks.append(
+            f"chunk={i}, section={sec}, blocks={len(fallback_ids)}"
         )
 
     results = dict(state["results"])
@@ -814,6 +849,8 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         "claim_preambles": claim_preambles,
         "id_mismatch_detected": id_mismatch_detected,
         "id_mismatch_chunks": id_mismatch_chunks,
+        "empty_fallback_count": empty_fallback_count,
+        "empty_fallback_chunks": empty_fallback_chunks,
     }
 
 
@@ -840,7 +877,16 @@ def route_after_claim_classify(state: TranslateState) -> str:
     chunk = state["chunks"][i]
     text = "\n".join((b.text or "") for b in chunk)
 
-    if re.search(r"제\s*\d+\s*항", text) or re.search(r"claim\s+\d+", text, re.IGNORECASE):
+    has_dep = bool(re.search(r"제\s*\d+\s*항", text) or re.search(r"claim\s+\d+", text, re.IGNORECASE))
+    has_indep = bool(
+        re.search(r"【\s*청구항\s*\d+\s*】", text)
+        or re.search(r"\b청구항\s*\d+\b", text)
+        or re.search(r"^\s*\d+\s*[.)]", text, re.MULTILINE)
+    )
+
+    if has_dep and has_indep:
+        return "translate_claims"
+    if has_dep:
         return "translate_claims_dep"
     return "translate_claims_indep"
 
@@ -900,6 +946,7 @@ def build_translation_graph():
         "classify_claims",
         route_after_claim_classify,
         {
+            "translate_claims": "translate_claims",
             "translate_claims_indep": "translate_claims_indep",
             "translate_claims_dep": "translate_claims_dep",
         },
@@ -1121,35 +1168,6 @@ def write_comparison_reports(
     return chunk_md_path, line_tsv_path
 
 
-def generate_compare_reports_for_docx(
-    *,
-    src_docx_path: str | Path,
-    out_docx_path: str | Path,
-    max_section_chars: int = 80_000,
-    max_chars_per_chunk: int = 5000,
-    chunk_overlap: int = 0,
-) -> tuple[Path, Path]:
-    """
-    Compare an existing source DOCX and translated DOCX without rerunning translation.
-    Returns (chunk_markdown_path, line_tsv_path).
-    """
-    src_docx_path = Path(src_docx_path)
-    out_docx_path = Path(out_docx_path)
-
-    blocks_list = list(iter_blocks(src_docx_path))
-    chunk_spans = build_section_chunks_with_fallback(
-        blocks_list,
-        max_section_chars=max_section_chars,
-        max_chars_per_chunk=max_chars_per_chunk,
-        chunk_overlap=chunk_overlap,
-    )
-    return write_comparison_reports(
-        src_docx_path=src_docx_path,
-        out_docx_path=out_docx_path,
-        chunk_spans=chunk_spans,
-    )
-
-
 # ============================================================
 # 9) End-to-end runner
 # ============================================================
@@ -1225,6 +1243,8 @@ def translate_docx(
             "claim_preambles": {},
             "id_mismatch_detected": False,
             "id_mismatch_chunks": [],
+            "empty_fallback_count": 0,
+            "empty_fallback_chunks": [],
         },
         config={"recursion_limit": max(50, len(chunks) * 3)},
     )
@@ -1236,6 +1256,13 @@ def translate_docx(
     if final.get("id_mismatch_detected"):
         details = "; ".join(final.get("id_mismatch_chunks", []))
         raise RuntimeError(f"ID mismatch detected after retries: {details}")
+
+    fallback_total = int(final.get("empty_fallback_count", 0) or 0)
+    if fallback_total > 0:
+        details = "; ".join(final.get("empty_fallback_chunks", []))
+        print(f"[QUALITY] empty-output fallbacks applied: {fallback_total} ({details})")
+    else:
+        print("[QUALITY] empty-output fallbacks applied: 0")
 
     print("Apply translations...")
     apply_translations_to_docx(src_docx_path, final["results"], out_docx_path)
