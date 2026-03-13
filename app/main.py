@@ -9,7 +9,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 
-from app.batch_tools import download_s3_file, translate_docx, list_s3_keys
+from app.utils import download_s3_file, list_s3_keys
+from app.translate import translate_docx
 from app.config import APIConfig, LLMModel
 from app.model.data_schemas import Bucket
 

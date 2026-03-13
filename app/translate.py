@@ -15,7 +15,7 @@ from docx import Document
 from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
-from app.batch_tools.chunking import (
+from app.chunking import (
     Block,
     BlockType,
     iter_blocks,
@@ -23,8 +23,7 @@ from app.batch_tools.chunking import (
     chunk_blocks_patent_with_spans,
     build_contexts,
 )
-from app.batch_tools.prompts import PROMPTS
-from app.batch_tools.post_process import _format_claim_linebreaks
+from app.prompts import PROMPTS
 
 # ============================================================
 # 0) Types
@@ -32,6 +31,24 @@ from app.batch_tools.post_process import _format_claim_linebreaks
 
 # NEW: add explicit "spec" (specification/description)
 Section = Literal["default", "spec", "claims", "abstract"]
+
+
+def _format_claim_linebreaks(text: str, indent: str = "    ") -> str:
+    """
+    Insert line breaks after ':' and ';' to improve claim readability.
+    Keeps punctuation and trims trailing spaces around inserted breaks.
+    """
+    if not text:
+        return text
+
+    s = re.sub(r"\s*:\s*", ":\n", text)
+    s = re.sub(r"\s*;\s*", ";\n", s)
+    lines = [line.strip() for line in s.splitlines()]
+    if not lines:
+        return ""
+    if len(lines) == 1:
+        return lines[0]
+    return "\n".join([lines[0]] + [f"{indent}{ln}" if ln else "" for ln in lines[1:]])
 
 
 class TranslateState(TypedDict):
