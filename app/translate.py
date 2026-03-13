@@ -324,7 +324,13 @@ def translate_chunk(
 ) -> tuple[Dict[str, str], List[Dict[str, str]], Dict[str, str]]:
     """Translate a chunk and return (translations, key_terms, new_claim_preambles)."""
     prompt = PROMPTS[prompt_name]
-    payload = [{"id": b.id, "text": b.text} for b in chunk]
+
+    # Option 1: Position-based mapping — use sequential integers (0, 1, 2...) instead of
+    # opaque string IDs like "p:12" or "cell:0:1:2:3". The LLM only needs to reproduce
+    # small integers, which eliminates almost all ID reproduction errors.
+    # We remap back to original string IDs after parsing the response.
+    pos_to_id = {i: b.id for i, b in enumerate(chunk)}
+    payload = [{"id": i, "text": b.text} for i, b in enumerate(chunk)]
 
     glossary_str = _format_glossary(glossary or {})
     prev_translation = prev_translated_text or "(none — this is the first chunk)"
@@ -341,16 +347,14 @@ def translate_chunk(
         claim_preambles=preambles_str,
     )
 
-    # Fix E: Always inject explicit required-ID list so the model knows exactly what to return.
-    # Placed at the very front so it receives maximum attention.
-    expected_ids = [b.id for b in chunk]
+    # Fix E: Inject the required integer positions at the top of every call.
+    n = len(chunk)
     ids_note = (
-        f"REQUIRED OUTPUT IDs — return EXACTLY these {len(expected_ids)} ids, no more, no less:\n"
-        f"{json.dumps(expected_ids, ensure_ascii=False)}\n\n"
+        f"REQUIRED OUTPUT IDs — return EXACTLY {n} items with integer ids 0 to {n - 1}, no more, no less:\n"
+        f"{json.dumps(list(range(n)))}\n\n"
     )
 
-    # Fix C: Retry instruction goes at the TOP (before IDs note and main prompt),
-    # not appended at the end where it gets less attention.
+    # Fix C: Retry instruction at the TOP so it gets maximum attention.
     if retry_instruction:
         user_prompt = (
             "⚠️ RETRY — CRITICAL FIXES REQUIRED FROM YOUR PREVIOUS ATTEMPT:\n"
@@ -392,12 +396,19 @@ def translate_chunk(
             repaired_json = extract_first_json_object(repaired) or repaired
             data = json.loads(repaired_json)
 
+    # Remap integer positions back to original string block IDs.
+    # Any position outside 0..N-1 is silently dropped (no "unexpected ID" noise).
     out: Dict[str, str] = {}
     translations = data.get("translations", [])
     if isinstance(translations, list):
         for item in translations:
             if isinstance(item, dict) and "id" in item and "text" in item:
-                out[str(item["id"])] = str(item["text"])
+                try:
+                    pos = int(item["id"])
+                    if pos in pos_to_id:
+                        out[pos_to_id[pos]] = str(item["text"])
+                except (ValueError, TypeError):
+                    pass
 
     # Extract key_terms for glossary accumulation
     key_terms: List[Dict[str, str]] = []
@@ -705,8 +716,10 @@ def _repair_missing_blocks(
     if not repair_blocks:
         return {}
 
-    payload = [{"id": b.id, "text": b.text} for b in repair_blocks]
-    expected_ids = [b.id for b in repair_blocks]
+    # Position-based mapping for repair call too: 0, 1, 2... → original string IDs
+    pos_to_id = {i: b.id for i, b in enumerate(repair_blocks)}
+    payload = [{"id": i, "text": b.text} for i, b in enumerate(repair_blocks)]
+    n = len(repair_blocks)
     glossary_str = _format_glossary(glossary or {})
     preambles_str = _format_claim_preambles(claim_preambles or {})
 
@@ -724,11 +737,11 @@ def _repair_missing_blocks(
         "Return exactly one translations item per input id — no omissions, no additions.\n"
     )
     user = (
-        f"REQUIRED IDs — return ALL of these, exactly:\n"
-        f"{json.dumps(expected_ids, ensure_ascii=False)}\n\n"
+        f"REQUIRED OUTPUT IDs — return EXACTLY {n} items with integer ids 0 to {n - 1}:\n"
+        f"{json.dumps(list(range(n)))}\n\n"
         f"GLOSSARY:\n{glossary_str}\n"
         f"{claims_note}"
-        f'Output schema: {{"translations":[{{"id":"...","text":"..."}}]}}\n\n'
+        f'Output schema: {{"translations":[{{"id":0,"text":"..."}},{{"id":1,"text":"..."}},...]}}\n\n'
         f"INPUT:\n{json.dumps(payload, ensure_ascii=False)}\n"
     )
 
@@ -753,9 +766,12 @@ def _repair_missing_blocks(
         out: Dict[str, str] = {}
         for item in data.get("translations", []):
             if isinstance(item, dict) and "id" in item and "text" in item:
-                bid = str(item["id"])
-                if bid in missing_set:
-                    out[bid] = str(item["text"])
+                try:
+                    pos = int(item["id"])
+                    if pos in pos_to_id:
+                        out[pos_to_id[pos]] = str(item["text"])
+                except (ValueError, TypeError):
+                    pass
         return out
     except Exception as exc:
         print(f"[REPAIR] call failed: {type(exc).__name__}: {exc}")
@@ -806,16 +822,19 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     fallback_ids: List[str] = []
     best_score: Tuple[int, int] = (10**9, 10**9)
 
-    # Fix B: track each attempt's specific missing/unexpected IDs for the next retry instruction
-    prev_attempt_missing: List[str] = []
-    prev_attempt_unexpected: List[str] = []
+    # Fix B: track each attempt's specific missing/unexpected IDs for the next retry instruction.
+    # We store them as integer positions (matching what the LLM sees) so the retry instruction
+    # is immediately actionable — the model already knows positions, not opaque string IDs.
+    id_to_pos = {b.id: i for i, b in enumerate(chunk)}
+    prev_attempt_missing_pos: List[int] = []
+    prev_attempt_unexpected_pos: List[int] = []
 
     for attempt in range(1, max_attempts + 1):
         retry_instruction = ""
         if attempt > 1:
             # Fix A: use non-zero temperature on retries so the model can produce different output
             attempt_temperature = 0.3
-            # Fix B: include the specific IDs that were wrong in the previous attempt
+            # Fix B: include the specific integer positions that were wrong in the previous attempt
             if sec == "claims":
                 base_msg = (
                     "Return exactly one translations item per input id. "
@@ -831,10 +850,10 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
                     "Only return empty text when the input text is actually empty or whitespace-only."
                 )
             issues: List[str] = []
-            if prev_attempt_missing:
-                issues.append(f"IDs missing from your last response (add them): {prev_attempt_missing}")
-            if prev_attempt_unexpected:
-                issues.append(f"IDs you added that were NOT in the input (remove them): {prev_attempt_unexpected}")
+            if prev_attempt_missing_pos:
+                issues.append(f"Integer ids missing from your last response (you must add these): {prev_attempt_missing_pos}")
+            if prev_attempt_unexpected_pos:
+                issues.append(f"Integer ids you returned that are out of range (remove these): {prev_attempt_unexpected_pos}")
             retry_instruction = base_msg
             if issues:
                 retry_instruction += "\n" + "\n".join(issues)
@@ -913,9 +932,11 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         if not cand_missing and not cand_unexpected and critical_fallbacks == 0:
             break
 
-        # Fix B: save this attempt's specific failures for the next retry instruction
-        prev_attempt_missing = list(cand_missing)
-        prev_attempt_unexpected = list(cand_unexpected)
+        # Fix B: convert missing/unexpected string IDs → integer positions for the next retry instruction
+        prev_attempt_missing_pos = [id_to_pos[bid] for bid in cand_missing if bid in id_to_pos]
+        # With position-based mapping, unexpected IDs from the model are already filtered at parse time.
+        # But if any slip through normalization, convert them too (best-effort).
+        prev_attempt_unexpected_pos = [id_to_pos[bid] for bid in cand_unexpected if bid in id_to_pos]
 
         if attempt < max_attempts:
             delay = (0.8 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
