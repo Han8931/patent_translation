@@ -13,9 +13,9 @@ from json import JSONDecodeError
 
 from docx import Document
 from langgraph.graph import StateGraph, END
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APITimeoutError
 
-from app.batch_tools.chunking import (
+from app.chunking import (
     Block,
     BlockType,
     iter_blocks,
@@ -23,8 +23,8 @@ from app.batch_tools.chunking import (
     chunk_blocks_patent_with_spans,
     build_contexts,
 )
-from app.batch_tools.prompts import PROMPTS
-from app.batch_tools.post_process import _format_claim_linebreaks
+from app.prompts import PROMPTS
+from app.post_process import _format_claim_linebreaks
 
 # ============================================================
 # 0) Types
@@ -472,6 +472,11 @@ _SPEC_HEADING_RE = re.compile(
     re.IGNORECASE,
 )
 
+_REPFIG_HEADING_RE = re.compile(
+    r"【?\s*대표\s*도\s*】?|대표\s*도면|REPRESENTATIVE\s+(?:DRAWING|FIGURE)",
+    re.IGNORECASE,
+)
+
 
 def _chunk_text(chunk: List[Block]) -> str:
     return "\n".join((b.text or "") for b in chunk)
@@ -496,6 +501,7 @@ def detect_section_from_chunk(prev: Section, chunk: List[Block]) -> Section:
     m_abs = _ABSTRACT_HEADING_RE.search(t)
     m_claim = _CLAIMS_HEADING_RE.search(t)
     m_spec = _SPEC_HEADING_RE.search(t)
+    m_repfig = _REPFIG_HEADING_RE.search(t)
 
     candidates: List[Tuple[Section, int]] = []
     if m_abs:
@@ -504,6 +510,8 @@ def detect_section_from_chunk(prev: Section, chunk: List[Block]) -> Section:
         candidates.append(("claims", m_claim.start()))
     if m_spec:
         candidates.append(("spec", m_spec.start()))
+    if m_repfig:
+        candidates.append(("default", m_repfig.start()))
 
     if candidates:
         candidates.sort(key=lambda x: x[1])
@@ -881,8 +889,13 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
                 f"LLM call raised {type(exc).__name__}: {exc}"
             )
             if attempt < max_attempts:
-                delay = (0.8 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
-                print(f"[RETRY] chunk {i}: retrying after exception in {delay:.2f}s")
+                if isinstance(exc, (APIConnectionError, APITimeoutError)):
+                    # Connection/timeout errors need much longer waits — server may be
+                    # overloaded or temporarily down. Use 15s, 45s backoff.
+                    delay = (15.0 * (3 ** (attempt - 1))) + random.uniform(0.0, 2.0)
+                else:
+                    delay = (0.8 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
+                print(f"[RETRY] chunk {i}: retrying after {type(exc).__name__} in {delay:.1f}s")
                 time.sleep(delay)
                 continue
             # All attempts exhausted — fall back to source text so the document isn't lost.
@@ -1464,4 +1477,6 @@ def translate_docx(
         print(f"[COMPARE] Line report: {line_tsv_path}")
 
     print("Done.")
+
+
 
