@@ -320,6 +320,7 @@ def translate_chunk(
     prev_translated_text: str = "",
     claim_preambles: Dict[str, str] | None = None,
     retry_instruction: str = "",
+    temperature: float = 0.0,  # Fix A: caller controls temperature per attempt
 ) -> tuple[Dict[str, str], List[Dict[str, str]], Dict[str, str]]:
     """Translate a chunk and return (translations, key_terms, new_claim_preambles)."""
     prompt = PROMPTS[prompt_name]
@@ -339,12 +340,26 @@ def translate_chunk(
         prev_translation=prev_translation,
         claim_preambles=preambles_str,
     )
+
+    # Fix E: Always inject explicit required-ID list so the model knows exactly what to return.
+    # Placed at the very front so it receives maximum attention.
+    expected_ids = [b.id for b in chunk]
+    ids_note = (
+        f"REQUIRED OUTPUT IDs — return EXACTLY these {len(expected_ids)} ids, no more, no less:\n"
+        f"{json.dumps(expected_ids, ensure_ascii=False)}\n\n"
+    )
+
+    # Fix C: Retry instruction goes at the TOP (before IDs note and main prompt),
+    # not appended at the end where it gets less attention.
     if retry_instruction:
         user_prompt = (
-            f"{user_prompt}\n\n"
-            "RETRY VALIDATION (CRITICAL):\n"
-            f"{retry_instruction}\n"
+            "⚠️ RETRY — CRITICAL FIXES REQUIRED FROM YOUR PREVIOUS ATTEMPT:\n"
+            f"{retry_instruction}\n\n"
+            + ids_note
+            + user_prompt
         )
+    else:
+        user_prompt = ids_note + user_prompt
 
     resp = client.chat.completions.create(
         model=model,
@@ -352,7 +367,7 @@ def translate_chunk(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.0,
+        temperature=temperature,  # Fix A: use caller-supplied temperature
     )
 
     content = (resp.choices[0].message.content or "").strip()
@@ -670,6 +685,83 @@ def _normalize_translations_for_chunk(
     return normalized, missing, unexpected, fallback_ids
 
 
+def _repair_missing_blocks(
+    client: OpenAI,
+    model: str,
+    chunk: List[Block],
+    missing_ids: List[str],
+    target_lang: str,
+    section: Section,
+    glossary: Dict[str, str] | None = None,
+    claim_preambles: Dict[str, str] | None = None,
+) -> Dict[str, str]:
+    """
+    Fix D: Targeted repair call — send ONLY the missing blocks with a minimal,
+    focused prompt. Much smaller payload → near-100% ID coverage.
+    Called after all main retry attempts still have missing IDs.
+    """
+    missing_set = set(missing_ids)
+    repair_blocks = [b for b in chunk if b.id in missing_set]
+    if not repair_blocks:
+        return {}
+
+    payload = [{"id": b.id, "text": b.text} for b in repair_blocks]
+    expected_ids = [b.id for b in repair_blocks]
+    glossary_str = _format_glossary(glossary or {})
+    preambles_str = _format_claim_preambles(claim_preambles or {})
+
+    claims_note = ""
+    if section == "claims":
+        claims_note = (
+            "\nSection is CLAIMS. For multi-line claims, put the full rendered claim text "
+            "in the first item of each claim and set remaining same-claim items to empty string.\n"
+            f"CLAIM PREAMBLES:\n{preambles_str}\n"
+        )
+
+    system = (
+        "You are a professional patent translation engine (Korean → English).\n"
+        "Translate each JSON item faithfully. Output ONLY valid JSON with double quotes.\n"
+        "Return exactly one translations item per input id — no omissions, no additions.\n"
+    )
+    user = (
+        f"REQUIRED IDs — return ALL of these, exactly:\n"
+        f"{json.dumps(expected_ids, ensure_ascii=False)}\n\n"
+        f"GLOSSARY:\n{glossary_str}\n"
+        f"{claims_note}"
+        f'Output schema: {{"translations":[{{"id":"...","text":"..."}}]}}\n\n'
+        f"INPUT:\n{json.dumps(payload, ensure_ascii=False)}\n"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        try:
+            data = json.loads(content)
+        except JSONDecodeError:
+            json_str = extract_first_json_object(content)
+            if not json_str:
+                return {}
+            data = json.loads(json_str)
+
+        out: Dict[str, str] = {}
+        for item in data.get("translations", []):
+            if isinstance(item, dict) and "id" in item and "text" in item:
+                bid = str(item["id"])
+                if bid in missing_set:
+                    out[bid] = str(item["text"])
+        return out
+    except Exception as exc:
+        print(f"[REPAIR] call failed: {type(exc).__name__}: {exc}")
+        return {}
+
+
 def _translate_with_prompt(state: TranslateState, prompt_name: str) -> TranslateState:
     i = state["i"]
     chunks = state["chunks"]
@@ -714,23 +806,40 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     fallback_ids: List[str] = []
     best_score: Tuple[int, int] = (10**9, 10**9)
 
+    # Fix B: track each attempt's specific missing/unexpected IDs for the next retry instruction
+    prev_attempt_missing: List[str] = []
+    prev_attempt_unexpected: List[str] = []
+
     for attempt in range(1, max_attempts + 1):
         retry_instruction = ""
         if attempt > 1:
+            # Fix A: use non-zero temperature on retries so the model can produce different output
+            attempt_temperature = 0.3
+            # Fix B: include the specific IDs that were wrong in the previous attempt
             if sec == "claims":
-                retry_instruction = (
+                base_msg = (
                     "Return exactly one translations item per input id. "
                     "Do not add new ids, do not remove ids, and keep each input id exactly once. "
                     "The FIRST item of each claim MUST have non-empty text with the full rendered claim. "
                     "Only set text to empty string for non-first items of a merged multi-item claim."
                 )
             else:
-                retry_instruction = (
+                base_msg = (
                     "Return exactly one translations item per input id. "
                     "Do not add new ids, do not remove ids, and keep each input id exactly once. "
                     "For EVERY non-empty input text, you MUST return a non-empty English translation. "
                     "Only return empty text when the input text is actually empty or whitespace-only."
                 )
+            issues: List[str] = []
+            if prev_attempt_missing:
+                issues.append(f"IDs missing from your last response (add them): {prev_attempt_missing}")
+            if prev_attempt_unexpected:
+                issues.append(f"IDs you added that were NOT in the input (remove them): {prev_attempt_unexpected}")
+            retry_instruction = base_msg
+            if issues:
+                retry_instruction += "\n" + "\n".join(issues)
+        else:
+            attempt_temperature = 0.0  # Fix A: first attempt stays deterministic
 
         try:
             cand_map, cand_terms, cand_preambles = translate_chunk(
@@ -745,6 +854,7 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
                 prev_translated_text=prev_translated_text,
                 claim_preambles=claim_preambles,
                 retry_instruction=retry_instruction,
+                temperature=attempt_temperature,  # Fix A
             )
         except Exception as exc:
             print(
@@ -803,6 +913,10 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
         if not cand_missing and not cand_unexpected and critical_fallbacks == 0:
             break
 
+        # Fix B: save this attempt's specific failures for the next retry instruction
+        prev_attempt_missing = list(cand_missing)
+        prev_attempt_unexpected = list(cand_unexpected)
+
         if attempt < max_attempts:
             delay = (0.8 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
             print(
@@ -812,6 +926,29 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
                 f"retrying in {delay:.2f}s"
             )
             time.sleep(delay)
+
+    # Fix D: targeted repair call for blocks that are still missing after all main attempts.
+    # Only re-sends the missing blocks with a small focused prompt → high ID-coverage success rate.
+    if missing_ids:
+        print(f"[REPAIR] chunk {i}: targeted repair for {len(missing_ids)} still-missing block(s): {missing_ids}")
+        repaired = _repair_missing_blocks(
+            client=client,
+            model=state["model"],
+            chunk=chunk,
+            missing_ids=missing_ids,
+            target_lang=state["target_lang"],
+            section=sec,
+            glossary=glossary,
+            claim_preambles=claim_preambles,
+        )
+        recovered = []
+        for bid, txt in repaired.items():
+            if txt.strip():
+                translated_map[bid] = txt
+                recovered.append(bid)
+        if recovered:
+            missing_ids = [bid for bid in missing_ids if bid not in recovered]
+            print(f"[REPAIR] chunk {i}: recovered {len(recovered)} block(s): {recovered}")
 
     if missing_ids or unexpected_ids:
         print(
@@ -1306,6 +1443,4 @@ def translate_docx(
         print(f"[COMPARE] Line report: {line_tsv_path}")
 
     print("Done.")
-
-
 
