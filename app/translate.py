@@ -15,7 +15,7 @@ from docx import Document
 from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
-from app.chunking import (
+from app.batch_tools.chunking import (
     Block,
     BlockType,
     iter_blocks,
@@ -23,7 +23,8 @@ from app.chunking import (
     chunk_blocks_patent_with_spans,
     build_contexts,
 )
-from app.prompts import PROMPTS
+from app.batch_tools.prompts import PROMPTS
+from app.batch_tools.post_process import _format_claim_linebreaks
 
 # ============================================================
 # 0) Types
@@ -31,24 +32,6 @@ from app.prompts import PROMPTS
 
 # NEW: add explicit "spec" (specification/description)
 Section = Literal["default", "spec", "claims", "abstract"]
-
-
-def _format_claim_linebreaks(text: str, indent: str = "    ") -> str:
-    """
-    Insert line breaks after ':' and ';' to improve claim readability.
-    Keeps punctuation and trims trailing spaces around inserted breaks.
-    """
-    if not text:
-        return text
-
-    s = re.sub(r"\s*:\s*", ":\n", text)
-    s = re.sub(r"\s*;\s*", ";\n", s)
-    lines = [line.strip() for line in s.splitlines()]
-    if not lines:
-        return ""
-    if len(lines) == 1:
-        return lines[0]
-    return "\n".join([lines[0]] + [f"{indent}{ln}" if ln else "" for ln in lines[1:]])
 
 
 class TranslateState(TypedDict):
@@ -734,26 +717,53 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     for attempt in range(1, max_attempts + 1):
         retry_instruction = ""
         if attempt > 1:
-            retry_instruction = (
-                "Return exactly one translations item per input id. "
-                "Do not add new ids, do not remove ids, and keep each input id exactly once. "
-                "For non-empty input text, do NOT return an empty text. "
-                "Only return empty text when the input is actually empty/whitespace."
-            )
+            if sec == "claims":
+                retry_instruction = (
+                    "Return exactly one translations item per input id. "
+                    "Do not add new ids, do not remove ids, and keep each input id exactly once. "
+                    "The FIRST item of each claim MUST have non-empty text with the full rendered claim. "
+                    "Only set text to empty string for non-first items of a merged multi-item claim."
+                )
+            else:
+                retry_instruction = (
+                    "Return exactly one translations item per input id. "
+                    "Do not add new ids, do not remove ids, and keep each input id exactly once. "
+                    "For EVERY non-empty input text, you MUST return a non-empty English translation. "
+                    "Only return empty text when the input text is actually empty or whitespace-only."
+                )
 
-        cand_map, cand_terms, cand_preambles = translate_chunk(
-            client=client,
-            model=state["model"],
-            prompt_name=prompt_name,
-            target_lang=state["target_lang"],
-            chunk=chunk,
-            context_before=ctx_before,
-            context_after=ctx_after,
-            glossary=glossary,
-            prev_translated_text=prev_translated_text,
-            claim_preambles=claim_preambles,
-            retry_instruction=retry_instruction,
-        )
+        try:
+            cand_map, cand_terms, cand_preambles = translate_chunk(
+                client=client,
+                model=state["model"],
+                prompt_name=prompt_name,
+                target_lang=state["target_lang"],
+                chunk=chunk,
+                context_before=ctx_before,
+                context_after=ctx_after,
+                glossary=glossary,
+                prev_translated_text=prev_translated_text,
+                claim_preambles=claim_preambles,
+                retry_instruction=retry_instruction,
+            )
+        except Exception as exc:
+            print(
+                f"[WARN] chunk {i}, attempt {attempt}/{max_attempts}: "
+                f"LLM call raised {type(exc).__name__}: {exc}"
+            )
+            if attempt < max_attempts:
+                delay = (0.8 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
+                print(f"[RETRY] chunk {i}: retrying after exception in {delay:.2f}s")
+                time.sleep(delay)
+                continue
+            # All attempts exhausted — fall back to source text so the document isn't lost.
+            print(
+                f"[FAIL] chunk {i}: all {max_attempts} attempts raised exceptions. "
+                f"Falling back to source text for this chunk."
+            )
+            cand_map = {b.id: (b.text or "") for b in chunk}
+            cand_terms = []
+            cand_preambles = {}
 
         # -------------------------
         # Claims: enforce merge + numbering (NEW)
@@ -771,7 +781,12 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
             translated_map=cand_map,
             section=sec,
         )
-        critical_fallbacks = len(cand_fallback_ids) if sec != "claims" else 0
+        if sec == "claims":
+            # Only the first block of a claim matters — non-first empties are intentional (merge rule).
+            first_id = chunk[0].id if chunk else None
+            critical_fallbacks = 1 if (first_id and first_id in cand_fallback_ids) else 0
+        else:
+            critical_fallbacks = len(cand_fallback_ids)
         cand_score = (
             len(cand_missing) + len(cand_unexpected) + critical_fallbacks,
             len(cand_unexpected),
@@ -811,13 +826,8 @@ def _translate_with_prompt(state: TranslateState, prompt_name: str) -> Translate
     if fallback_ids:
         print(
             f"[WARN] chunk {i}: empty translation fallback applied to "
-            f"{len(fallback_ids)} block(s)"
+            f"{len(fallback_ids)} block(s) in section '{sec}' — source text preserved"
         )
-        if sec != "claims":
-            raise RuntimeError(
-                f"Non-claims empty/missing translation detected after retries "
-                f"(chunk={i}, section={sec}, blocks={len(fallback_ids)})"
-            )
         empty_fallback_count += len(fallback_ids)
         empty_fallback_chunks.append(
             f"chunk={i}, section={sec}, blocks={len(fallback_ids)}"
@@ -1263,7 +1273,9 @@ def translate_docx(
             "empty_fallback_count": 0,
             "empty_fallback_chunks": [],
         },
-        config={"recursion_limit": max(50, len(chunks) * 3)},
+        # Each chunk takes up to ~5 graph steps (route→classify→translate→postprocess→route).
+        # Add a fixed buffer of 50 to cover the final finalize_abstract pass.
+        config={"recursion_limit": max(100, len(chunks) * 6 + 50)},
     )
 
     # If the document ends while still in abstract (or word count exists), finalize again defensively
@@ -1272,7 +1284,7 @@ def translate_docx(
 
     if final.get("id_mismatch_detected"):
         details = "; ".join(final.get("id_mismatch_chunks", []))
-        raise RuntimeError(f"ID mismatch detected after retries: {details}")
+        print(f"[WARN] ID mismatch detected after retries (partial source text preserved): {details}")
 
     fallback_total = int(final.get("empty_fallback_count", 0) or 0)
     if fallback_total > 0:
@@ -1294,3 +1306,6 @@ def translate_docx(
         print(f"[COMPARE] Line report: {line_tsv_path}")
 
     print("Done.")
+
+
+
